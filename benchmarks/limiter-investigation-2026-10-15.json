@@ -1,0 +1,178 @@
+{
+  "recording": "build/profile/verified-limiters.trace",
+  "configuration": "Performance Limiters; profile13 observed from Instruments UI-generated recording, device4294969056",
+  "recording_status": "xctrace exit2: logging stream error; GPU tables exported successfully",
+  "raw_counter_rows": 6450950,
+  "selection": "Raw counter timestamps falling within exported mccl Compute intervals. Includes merge, copy, warmup and setup dispatches; counters device-wide and may include concurrent desktop work. Point-sample means, not time-weighted or per-kernel isolated.",
+  "compute_intervals": 1135,
+  "counters": [
+    {
+      "counter": "Kernel Occupancy",
+      "samples": 70927,
+      "mean": 85.90189245660375,
+      "median": 99.741605879,
+      "p90": 99.766299868
+    },
+    {
+      "counter": "Total Occupancy",
+      "samples": 70927,
+      "mean": 89.01192975820122,
+      "median": 99.742346184,
+      "p90": 99.766488971
+    },
+    {
+      "counter": "Occupancy Manager Target",
+      "samples": 70927,
+      "mean": 90.05602354471588,
+      "median": 100.0,
+      "p90": 100.0
+    },
+    {
+      "counter": "Instruction Throughput Limiter",
+      "samples": 70927,
+      "mean": 31.293344176889626,
+      "median": 42.27120109,
+      "p90": 45.623353269
+    },
+    {
+      "counter": "Instruction Throughput Utilization",
+      "samples": 70927,
+      "mean": 11.18102120717813,
+      "median": 14.930525696,
+      "p90": 16.082460342
+    },
+    {
+      "counter": "Compute Shader Launch Limiter",
+      "samples": 70927,
+      "mean": 96.43395875516404,
+      "median": 100.0,
+      "p90": 100.0
+    },
+    {
+      "counter": "ALU Utilization",
+      "samples": 70927,
+      "mean": 11.879909407559875,
+      "median": 15.298309773,
+      "p90": 16.495819455
+    },
+    {
+      "counter": "Integer and Conditional Limiter",
+      "samples": 70927,
+      "mean": 28.978245403133812,
+      "median": 39.3955567,
+      "p90": 42.111494731
+    },
+    {
+      "counter": "Control Flow Limiter",
+      "samples": 70927,
+      "mean": 35.277382966582465,
+      "median": 49.096336739,
+      "p90": 52.500515078
+    },
+    {
+      "counter": "Integer and Complex Limiter",
+      "samples": 70927,
+      "mean": 2.211399043706311,
+      "median": 2.184767639,
+      "p90": 2.391266822
+    },
+    {
+      "counter": "L1 Cache Limiter",
+      "samples": 70927,
+      "mean": 4.485112133976617,
+      "median": 6.103208342,
+      "p90": 6.595420131
+    },
+    {
+      "counter": "L1 Cache Utilization",
+      "samples": 70927,
+      "mean": 4.484699716356841,
+      "median": 6.102807798,
+      "p90": 6.594880182
+    },
+    {
+      "counter": "Register Pressure Influence",
+      "samples": 70927,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0
+    },
+    {
+      "counter": "L1 Cache Pressure Influence",
+      "samples": 70927,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0
+    },
+    {
+      "counter": "Memory Request Stalls Influence",
+      "samples": 70927,
+      "mean": 26.56138854018502,
+      "median": 0.0,
+      "p90": 81.359872357
+    },
+    {
+      "counter": "L1 Read Bandwidth",
+      "samples": 70927,
+      "mean": 641.8276252745567,
+      "median": 914.632227037,
+      "p90": 995.7823184
+    },
+    {
+      "counter": "L1 Write Bandwidth",
+      "samples": 70927,
+      "mean": 317.32709405126104,
+      "median": 408.050997311,
+      "p90": 442.156510195
+    },
+    {
+      "counter": "Threadgroup Memory L1 Read Bandwidth",
+      "samples": 70927,
+      "mean": 524.0422138003522,
+      "median": 821.627715935,
+      "p90": 898.063173982
+    },
+    {
+      "counter": "Threadgroup Memory L1 Write Bandwidth",
+      "samples": 70927,
+      "mean": 212.5532555768542,
+      "median": 333.342419343,
+      "p90": 364.301648154
+    },
+    {
+      "counter": "GPU Bandwidth",
+      "samples": 28892,
+      "mean": 170.19998063777084,
+      "median": 151.316671662,
+      "p90": 254.64182523
+    },
+    {
+      "counter": "GPU Read Bandwidth",
+      "samples": 28892,
+      "mean": 87.95457012839174,
+      "median": 79.643468884,
+      "p90": 127.173447225
+    },
+    {
+      "counter": "GPU Write Bandwidth",
+      "samples": 28892,
+      "mean": 82.24541050887983,
+      "median": 71.915946631,
+      "p90": 127.496336484
+    },
+    {
+      "counter": "MMU Limiter",
+      "samples": 28892,
+      "mean": 65.07987926375876,
+      "median": 53.55774227,
+      "p90": 100.0
+    },
+    {
+      "counter": "Last Level Cache Limiter",
+      "samples": 28892,
+      "mean": 76.59949478914828,
+      "median": 71.565483535,
+      "p90": 100.0
+    }
+  ]
+}

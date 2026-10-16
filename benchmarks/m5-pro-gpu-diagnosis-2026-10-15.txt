@@ -1,0 +1,23 @@
+Unmodified build/native/mccl.metallib dispatched directly through Metal, outside MLX.
+Buffers allocated before timing, 256 threads and 1024 outputs per tile.
+10 warmups and 60 alternating merge/copy repetitions per case.
+GPU times from completed command buffer gpuEndTime - gpuStartTime (one dispatch per buffer).
+Full outputs checked exactly after timing. Active desktop; no hardware limiter counters collected.
+
+GPU: Apple M5 Pro
+pipeline=merge, simd_width=32, max_threads=1024, static_threadgroup_bytes=8208
+pipeline=copy, simd_width=32, max_threads=1024, static_threadgroup_bytes=0
+case,keys,operation,gpu_median_us,gpu_p10_us,gpu_p90_us,gpu_logical_gb_s
+disjoint,1048576,merge,80.271,76.917,119.625,104.504
+disjoint,1048576,copy,28.875,28.042,54.458,290.515
+interleaved,1048576,merge,116.146,113.208,179.333,72.225
+interleaved,1048576,copy,28.833,28.083,86.792,290.935
+duplicates,1048576,merge,119.229,116.667,186.458,70.357
+duplicates,1048576,copy,28.542,28.083,57.750,293.906
+disjoint,33554432,merge,1558.000,1540.666,2204.167,172.295
+disjoint,33554432,copy,1007.375,987.750,1299.500,266.470
+interleaved,33554432,merge,1759.458,1746.250,2651.292,152.567
+interleaved,33554432,copy,996.708,981.875,1034.000,269.322
+duplicates,33554432,merge,1774.063,1761.000,2693.292,151.311
+duplicates,33554432,copy,995.771,980.875,1221.875,269.576
+All GPU command buffers completed; exact full-output checks passed.

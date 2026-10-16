@@ -1,0 +1,16 @@
+[package]
+name = "mccl"
+version = "0.1.0"
+edition = "2021"
+description = "Stable u32 merge on MLX Metal with a matched forced-copy benchmark"
+license = "MIT"
+build = "build.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = "none"

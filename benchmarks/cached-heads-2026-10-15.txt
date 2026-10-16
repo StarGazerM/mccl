@@ -1,0 +1,22 @@
+Diagnostic paired comparison of compiled baseline and cached-head libraries. GPU command-buffer timestamps; preallocated buffers; 10 warmups and 60 repetitions, alternating variant order. Active desktop, no counter instrumentation during timing. Candidate rejected; source restored.
+
+pipeline 0: SIMD 32, max threads 1024, threadgroup bytes 8208
+pipeline 1: SIMD 32, max threads 1024, threadgroup bytes 8208
+keys,distribution,variant,median_gpu_us,p10_gpu_us,p90_gpu_us
+1048576,disjoint,baseline,62.604,62.075,143.513
+1048576,disjoint,cached,65.750,65.246,153.312
+1048576,reverse-disjoint,baseline,62.875,62.662,63.250
+1048576,reverse-disjoint,cached,65.979,65.583,66.300
+1048576,interleaved,baseline,91.000,90.625,113.062
+1048576,interleaved,cached,88.146,87.829,108.754
+1048576,duplicates,baseline,116.396,93.538,117.554
+1048576,duplicates,cached,118.125,95.000,118.917
+33554432,disjoint,baseline,1589.604,1555.475,1963.625
+33554432,disjoint,cached,1633.271,1565.575,2010.313
+33554432,reverse-disjoint,baseline,1583.313,1559.837,1939.463
+33554432,reverse-disjoint,cached,1604.792,1575.967,1978.225
+33554432,interleaved,baseline,1759.417,1745.463,2066.638
+33554432,interleaved,cached,1741.812,1730.100,2090.371
+33554432,duplicates,baseline,1777.354,1761.000,2216.350
+33554432,duplicates,cached,1789.333,1772.912,2097.600
+All full-output comparisons passed.
