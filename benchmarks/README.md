@@ -29,5 +29,15 @@ undocumented profile IDs. Counter influence metrics are not fractions of time
 stalled. Samples remain device-wide even when selected by target GPU intervals.
 
 The archive includes local process/device metadata; review it before public
-sharing. It has been retained locally, not uploaded. The original artifacts under
-`build/` also remain intact. The archive passed `gzip -t` when created.
+sharing. It is retained locally and as an asset of the private GitHub release
+`merge-checkpoint-2026-10-15` in `StarGazerM/mccl`, not in Git history.
+The original artifacts under `build/` also remain intact. The archive passed
+`gzip -t`; GitHub's uploaded SHA-256 digest matches the local checksum.
+
+Retrieve it into a fresh checkout with:
+
+```sh
+gh release download merge-checkpoint-2026-10-15 --repo StarGazerM/mccl \
+  --pattern merge-profile-raw-2026-10-15.tar.gz --dir benchmarks
+shasum -a 256 -c benchmarks/SHA256SUMS
+```
