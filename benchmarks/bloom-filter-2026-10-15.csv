@@ -1,0 +1,4 @@
+operation,insert_keys,query_keys,num_blocks,seed,reps,warmup,timing,p50_us,p10_us,p90_us,member_queries,absent_queries,false_positives,true_negatives,observed_fpr
+clear,1048576,2097152,65536,0,30,5,cpu_wall_completed_call,603.958,202.258,754.641,1048576,1048576,1382,1047194,0.001317978
+insert,1048576,2097152,65536,0,30,5,cpu_wall_completed_call,731.521,450.300,904.838,1048576,1048576,1382,1047194,0.001317978
+query,1048576,2097152,65536,0,30,5,cpu_wall_completed_call,761.750,405.688,953.104,1048576,1048576,1382,1047194,0.001317978

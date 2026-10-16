@@ -1,0 +1,13 @@
+case,N_A,N_B,count,reps,warmup,timing,p50_us,p10_us,p90_us
+disjoint,32768,32768,32768,30,5,cpu_wall_completed_call,518.166,501.400,546.100
+reverse-disjoint,32768,32768,32768,30,5,cpu_wall_completed_call,583.229,533.308,606.234
+interleaved,32768,32768,32768,30,5,cpu_wall_completed_call,585.980,541.058,625.700
+duplicates,32768,32768,0,30,5,cpu_wall_completed_call,589.875,536.987,624.071
+disjoint,524288,524288,524288,30,5,cpu_wall_completed_call,1258.521,1202.879,1350.263
+reverse-disjoint,524288,524288,524288,30,5,cpu_wall_completed_call,985.645,821.534,1082.829
+interleaved,524288,524288,524288,30,5,cpu_wall_completed_call,772.479,751.404,879.205
+duplicates,524288,524288,0,30,5,cpu_wall_completed_call,767.583,724.413,880.471
+disjoint,2097152,2097152,2097152,30,5,cpu_wall_completed_call,2327.792,2311.458,2363.108
+reverse-disjoint,2097152,2097152,2097152,30,5,cpu_wall_completed_call,2289.874,2276.029,2330.446
+interleaved,2097152,2097152,2097152,30,5,cpu_wall_completed_call,2283.750,2275.870,2322.651
+duplicates,2097152,2097152,0,30,5,cpu_wall_completed_call,2171.895,2157.637,2197.196

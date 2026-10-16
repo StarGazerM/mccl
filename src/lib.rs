@@ -23,6 +23,11 @@ mod ffi {
     pub struct Stream {
         pub ctx: *mut c_void,
     }
+
+    #[repr(C)]
+    pub struct Bloom {
+        _private: [u8; 0],
+    }
     // mlx/c/array.h at the commit pinned by CMake: MLX_UINT32 = 3.
     pub const UINT32: c_int = 3;
     extern "C" {
@@ -41,11 +46,30 @@ mod ffi {
         pub fn mlx_array_free(array: Array) -> c_int;
         pub fn mlx_array_eval(array: Array) -> c_int;
         pub fn mlx_array_data_uint32(array: Array) -> *const u32;
+        pub fn mlx_array_item_uint64(out: *mut u64, array: Array) -> c_int;
         pub fn mlx_default_gpu_stream_new() -> Stream;
         pub fn mlx_stream_free(stream: Stream) -> c_int;
         pub fn mlx_synchronize(stream: Stream) -> c_int;
         pub fn mccl_merge_sorted_u32(out: *mut Array, a: Array, b: Array, stream: Stream) -> c_int;
+        pub fn mccl_difference_sorted_u32(
+            storage: *mut Array,
+            count: *mut Array,
+            a: Array,
+            b: Array,
+            stream: Stream,
+        ) -> c_int;
         pub fn mccl_copy_u32(out: *mut Array, a: Array, stream: Stream) -> c_int;
+        pub fn mccl_bloom_create(
+            out: *mut *mut Bloom,
+            num_blocks: u32,
+            seed: u64,
+            stream: Stream,
+        ) -> c_int;
+        pub fn mccl_bloom_free(filter: *mut Bloom) -> c_int;
+        pub fn mccl_bloom_clear(filter: *mut Bloom) -> c_int;
+        pub fn mccl_bloom_add(filter: *mut Bloom, keys: Array) -> c_int;
+        pub fn mccl_bloom_contains(out: *mut Array, filter: *mut Bloom, keys: Array) -> c_int;
+        pub fn mccl_bloom_read_words(filter: *mut Bloom, out: *mut u32, words: usize) -> c_int;
         pub fn mccl_last_error() -> *const c_char;
     }
 }
@@ -134,7 +158,8 @@ pub struct Gpu {
 }
 
 /// An owned one-dimensional MLX u32 array, retaining its stream context.
-/// Operations are lazy until eval() or to_vec(). No raw pointers escape this API.
+/// Merge/copy operations are lazy until eval() or to_vec(); Bloom queries are eager.
+/// No raw pointers escape this API.
 pub struct U32Array {
     raw: ffi::Array,
     len: usize,
@@ -144,6 +169,159 @@ pub struct U32Array {
 impl Drop for U32Array {
     fn drop(&mut self) {
         unsafe { ffi::mlx_array_free(self.raw) };
+    }
+}
+
+/// A thread-affine blocked Bloom filter for arbitrary u32 keys.
+///
+/// Each block contains eight u32 words. The seed is fixed for the filter's lifetime.
+/// Positive queries are approximate (false positives are possible); a completed
+/// insertion never produces false negatives until the filter is cleared.
+/// Creation, insertion, clearing, and queries complete on the GPU before returning.
+/// The filter retains its context and is neither Clone, Send, nor Sync.
+pub struct BloomFilter {
+    raw: *mut ffi::Bloom,
+    num_blocks: u32,
+    seed: u64,
+    context: Gpu,
+}
+
+impl Drop for BloomFilter {
+    fn drop(&mut self) {
+        unsafe { ffi::mccl_bloom_free(self.raw) };
+    }
+}
+
+impl BloomFilter {
+    pub fn num_blocks(&self) -> u32 {
+        self.num_blocks
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Inserts all keys, including duplicates, zero, and u32::MAX, and waits.
+    /// Keys must belong to this filter's GPU context. Empty input is accepted.
+    pub fn add(&mut self, keys: &U32Array) -> Result<()> {
+        self.context.check_context(keys)?;
+        native_status(
+            unsafe { ffi::mccl_bloom_add(self.raw, keys.raw) },
+            "insert Bloom keys",
+        )
+    }
+
+    /// Clears every bit and waits for completion, preserving the seed and size.
+    pub fn clear(&mut self) -> Result<()> {
+        native_status(
+            unsafe { ffi::mccl_bloom_clear(self.raw) },
+            "clear Bloom filter",
+        )
+    }
+
+    /// Returns completed u32 flags in key order: zero means absent, one means
+    /// possibly present. Positive results are approximate, not proof of membership.
+    /// The returned snapshot is independent of subsequent insertion or clearing.
+    pub fn contains(&self, keys: &U32Array) -> Result<U32Array> {
+        self.context.check_context(keys)?;
+        let mut out = self.context.output(keys.len);
+        native_status(
+            unsafe { ffi::mccl_bloom_contains(&mut out.raw, self.raw, keys.raw) },
+            "query Bloom filter",
+        )?;
+        Ok(out)
+    }
+
+    /// Explicitly reads the block-major eight-word-per-block bitset to the host.
+    /// This allocation and host readback are not part of insertion or querying.
+    pub fn words(&self) -> Result<Vec<u32>> {
+        let mut words = vec![0; self.num_blocks as usize * 8];
+        native_status(
+            unsafe { ffi::mccl_bloom_read_words(self.raw, words.as_mut_ptr(), words.len()) },
+            "read Bloom words",
+        )?;
+        Ok(words)
+    }
+}
+
+/// A lazy stable sorted multiset difference, retaining its GPU context.
+///
+/// Only the first `count()` elements of its private capacity buffer are initialized.
+/// No API exposes the uninitialized tail. Neither this type nor its context is
+/// Send or Sync.
+pub struct Difference {
+    storage: ffi::Array,
+    count: ffi::Array,
+    capacity: usize,
+    stream: Rc<StreamInner>,
+}
+
+impl Drop for Difference {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::mlx_array_free(self.storage);
+            ffi::mlx_array_free(self.count);
+        }
+    }
+}
+
+impl Difference {
+    /// The storage capacity, equal to the length of A; does not evaluate the graph.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Evaluates both storage and count and synchronizes the GPU stream.
+    /// This completes the full graph without reading count onto the host.
+    pub fn eval(&self) -> Result<()> {
+        clear_mlx_error();
+        mlx_status(
+            unsafe { ffi::mlx_array_eval(self.storage) },
+            "evaluate difference storage",
+        )?;
+        clear_mlx_error();
+        mlx_status(
+            unsafe { ffi::mlx_array_eval(self.count) },
+            "evaluate difference count",
+        )?;
+        clear_mlx_error();
+        mlx_status(
+            unsafe { ffi::mlx_synchronize(self.stream.0) },
+            "synchronize GPU stream",
+        )
+    }
+
+    /// Evaluates and synchronizes, then explicitly reads the scalar count to host.
+    pub fn count(&self) -> Result<usize> {
+        self.eval()?;
+        let mut count = 0_u64;
+        clear_mlx_error();
+        mlx_status(
+            unsafe { ffi::mlx_array_item_uint64(&mut count, self.count) },
+            "read difference count",
+        )?;
+        let count =
+            usize::try_from(count).map_err(|_| Error("difference count exceeds usize".into()))?;
+        if count > self.capacity {
+            return Err(Error("difference count exceeds storage capacity".into()));
+        }
+        Ok(count)
+    }
+
+    /// Evaluates and synchronizes, then copies only the initialized survivor prefix.
+    /// Reading the count and the values both explicitly transfers data to the host.
+    pub fn to_vec(&self) -> Result<Vec<u32>> {
+        let count = self.count()?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        clear_mlx_error();
+        let data = unsafe { ffi::mlx_array_data_uint32(self.storage) };
+        if data.is_null() {
+            return Err(mlx_failure("read difference storage"));
+        }
+        // The native scatter initializes exactly this contiguous prefix.
+        Ok(unsafe { std::slice::from_raw_parts(data, count) }.to_vec())
     }
 }
 
@@ -160,6 +338,26 @@ impl Gpu {
         Ok(Self {
             stream: Rc::new(StreamInner(raw)),
         })
+    }
+
+    /// Creates a cleared, completed blocked Bloom filter with a fixed hash seed.
+    /// `num_blocks` must be positive and eight times this value must fit INT_MAX.
+    /// Positive membership results are approximate.
+    pub fn bloom(&self, num_blocks: u32, seed: u64) -> Result<BloomFilter> {
+        if num_blocks == 0 || num_blocks > c_int::MAX as u32 / 8 {
+            return Err(Error("Bloom blocks must be in 1..=INT_MAX/8".into()));
+        }
+        let mut filter = BloomFilter {
+            raw: ptr::null_mut(),
+            num_blocks,
+            seed,
+            context: self.clone(),
+        };
+        native_status(
+            unsafe { ffi::mccl_bloom_create(&mut filter.raw, num_blocks, seed, self.stream.0) },
+            "create Bloom filter",
+        )?;
+        Ok(filter)
     }
 
     /// Copies host values into a freshly dispatched GPU buffer and waits for completion.
@@ -217,6 +415,37 @@ impl Gpu {
         native_status(
             unsafe { ffi::mccl_merge_sorted_u32(&mut out.raw, a.raw, b.raw, self.stream.0) },
             "merge sorted u32",
+        )?;
+        Ok(out)
+    }
+
+    /// Builds a lazy stable multiset difference A minus B.
+    ///
+    /// Both inputs must be sorted ascending. Each B occurrence cancels the earliest
+    /// remaining equal occurrence in A; survivors retain their original order.
+    /// Sortedness is not checked on the host. Unsorted inputs have unspecified
+    /// results but remain memory-safe. Each input length must fit INT_MAX.
+    /// Graph construction never reads the survivor count onto the host.
+    pub fn difference(&self, a: &U32Array, b: &U32Array) -> Result<Difference> {
+        self.check_context(a)?;
+        self.check_context(b)?;
+        let mut out = Difference {
+            storage: unsafe { ffi::mlx_array_new() },
+            count: unsafe { ffi::mlx_array_new() },
+            capacity: a.len,
+            stream: Rc::clone(&self.stream),
+        };
+        native_status(
+            unsafe {
+                ffi::mccl_difference_sorted_u32(
+                    &mut out.storage,
+                    &mut out.count,
+                    a.raw,
+                    b.raw,
+                    self.stream.0,
+                )
+            },
+            "difference sorted u32",
         )?;
         Ok(out)
     }

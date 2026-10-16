@@ -1,8 +1,8 @@
-# MCCL: MLX-backed stable merge
+# MCCL: MLX-backed GPU operations
 
-A standalone stable ascending merge of two sorted one-dimensional `u32` arrays.
-Rust calls a C ABI backed by an MLX C++ primitive and an offline-compiled Metal
-kernel. This is merge, not merge sort. There is no Python runtime dependency.
+Stable ascending merge, multiset difference, and a blocked Bloom filter for `u32`
+keys. Rust calls a C ABI backed by MLX C++ operations and offline-compiled Metal
+kernels. There is no Python runtime dependency.
 
 ## Build and run
 
@@ -51,7 +51,7 @@ counters. The resulting trace metadata still reported `Counter Set: (null)` and
 `Shader Timeline: Disabled`. Source attribution, recording health, and counter
 configuration must be checked separately.
 
-## API and semantics
+## Sorted-array API and semantics
 
 ```rust
 use mccl::Gpu;
@@ -65,7 +65,7 @@ assert_eq!(merged.to_vec()?, [1, 2, 3, 4, 5, 6]);
 ```
 
 The C entry points in `include/mccl.h` are `mccl_merge_sorted_u32`,
-`mccl_copy_u32`, and `mccl_last_error`. They accept official mlx-c handles and
+`mccl_difference_sorted_u32`, `mccl_copy_u32`, and `mccl_last_error`. They accept official mlx-c handles and
 build lazy graphs. Evaluate the output and synchronize its stream before host
 access. Native graph-construction errors return nonzero and preserve the previous
 output; evaluation errors follow mlx-c's error-handler mechanism.
@@ -74,7 +74,7 @@ output; evaluation errors follow mlx-c's error-handler mechanism.
 - Merge is A-before-B for equal keys. Key-only results cannot expose equal-key
   provenance; stability follows the asymmetric co-rank and left-first merge rule.
 - Empty inputs, unequal lengths, duplicate keys, and `UINT_MAX` are supported.
-- Combined length must fit `INT_MAX`. Only GPU streams and 1D u32 arrays are accepted.
+- Merge's combined length must fit `INT_MAX`; difference limits each input to `INT_MAX`. Only GPU streams and 1D u32 arrays are accepted.
 - C inputs may be strided; MLX makes them contiguous, potentially adding a copy.
 - Rust uploads produce initialized contiguous GPU buffers. Uploads wait; merge and
   copy remain lazy. Arrays retain input graphs and their thread-affine context.
@@ -84,6 +84,90 @@ output; evaluation errors follow mlx-c's error-handler mechanism.
   error handler; callers sharing mlx-c must account for that handler ownership.
 - CPU execution, other dtypes, payload merging, autodiff, and vectorized transforms
   are not implemented by this operation.
+
+## Sorted multiset difference
+
+`gpu.difference(&a, &b)?` subtracts multiplicities: each occurrence in B cancels
+the earliest equal occurrence in A. For `[1,1,1,2,4] - [1,1,3]`, the result is
+`[1,2,4]`. This is not a membership/anti-join filter.
+
+The returned `Difference` owns private storage of capacity `a.len()` plus a
+device-resident uint64 count. `capacity()` is metadata-only; `eval()` completes
+the storage/count graphs; `count()` and `to_vec()` explicitly synchronize and
+read back. `to_vec()` reads only the initialized survivor prefix, never the tail.
+No host count read is needed to construct or execute the GPU graph.
+
+Implementation: three MLX lower/upper-bound searches determine occurrence rank
+and B multiplicity, followed by a binary keep mask, exclusive scan, count reduction,
+and stable Metal scatter. Empty inputs are handled explicitly. This implementation
+is a correct multi-stage baseline, not a claimed optimal tiled set algorithm.
+
+```sh
+cargo run --release -- difference-bench --sizes 64K,1M --reps 20 --warmup 5
+```
+
+Sizes denote combined A+B length. CSV reports each input length, survivor count,
+and completed-call latency; no single-pass bandwidth formula is applied.
+The initial release run passed 100 difference cases and all 456 merge cases with
+Metal Shader Validation enabled. At 524,288 elements per input, the initial
+20-sample median was approximately 0.74–0.93 ms across disjoint, interleaved, and
+equal-multiplicity duplicate inputs. These are wall timings, not GPU-counter
+measurements; no memory-boundness conclusion is established for difference.
+
+
+## Blocked Bloom filter
+
+```rust
+let mut filter = gpu.bloom(65_536, 0)?; // block count, xxHash64 seed
+let keys = gpu.upload(&[1, 2, 3, u32::MAX])?;
+filter.add(&keys)?;
+assert_eq!(filter.contains(&keys)?.to_vec()?, [1, 1, 1, 1]);
+filter.clear()?;
+assert_eq!(filter.contains(&keys)?.to_vec()?, [0, 0, 0, 0]);
+```
+
+This implements RCCL's eight-word blocked policy for **four-byte little-endian
+u32 keys**: seeded xxHash64, multiply-shift block selection, and one salted bit
+in each of eight uint32 words. Storage is `num_blocks * 32` bytes. All u32 keys
+are valid, including zero and `UINT_MAX`; inputs need not be sorted.
+
+`BloomFilter` provides `add`, `contains`, `clear`, `words`, `num_blocks`, and
+`seed`. Construction, mutation, and queries complete before returning. Insert
+uses device atomic OR in place, with no full-filter copy. Queries return independent
+completed u32 flag arrays, unaffected by subsequent mutation or filter destruction.
+`words()` is an explicit host snapshot for inspection. The filter retains its GPU
+context and is neither Clone, Send, nor Sync. Cross-context keys are rejected.
+
+Zero means absent; one means **possibly present**, never exact membership.
+Completed insertion has no false negatives until clear, but false positives are
+expected. There is no per-key erase, u64-key API, automatic FPR sizing, concurrent
+insert/query contract, or hash map in this implementation. Block count must be
+positive with `num_blocks * 8 <= INT_MAX`. GPU mutation errors are not transactional.
+
+The C ABI exposes `mccl_bloom_create/free/clear/add/contains/read_words`; see
+`include/mccl.h` for ownership and error requirements. Direct encoding uses
+MLX's stream encoder and its commit/wait/error-check synchronization path.
+
+```sh
+cargo run --release -- bloom-check
+cargo run --release -- bloom-bench --keys 1M --queries 2M \
+  --blocks 65536 --seed 0 --reps 30 --warmup 5
+```
+
+Verification: 84 Bloom cases passed with Metal Shader Validation, including
+exact CPU/GPU words, contention, duplicate inserts, incremental additions,
+clear, empty/extreme keys, seeds, snapshot isolation and lifetime/context checks.
+Six additional GPU bit-layout fixtures matched independent Python `xxhash==3.6.0`
+results, including strided C inputs. Existing merge/difference regressions passed.
+
+Initial data is in `benchmarks/bloom-filter-2026-10-15.csv`. Inserting 1,048,576
+distinct keys into 65,536 blocks (2 MiB), then querying 1,048,576 members and
+1,048,576 known nonmembers, produced 1,382 false positives (0.1318% of nonmembers)
+and no false negatives. GPU bits and query flags matched the CPU oracle.
+The observed rate is empirical, not a bound on arbitrary data.
+Clear/insert/query medians were 0.604/0.732/0.762 ms. These include CPU submission
+and completion; timing variability was substantial. No GPU bottleneck claim is
+made from these wall timings.
 
 ## Apple execution design
 
