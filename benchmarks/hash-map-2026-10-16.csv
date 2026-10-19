@@ -1,0 +1,4 @@
+operation,insert_keys,query_keys,capacity,seed,reps,warmup,timing,p50_us,p10_us,p90_us
+insert,65536,65536,131072,0,30,5,cpu_wall_completed_call,586.979,543.341,626.225
+find,65536,65536,131072,0,30,5,cpu_wall_completed_call,258.938,226.480,268.053
+erase,65536,65536,131072,0,30,5,cpu_wall_completed_call,297.791,268.063,332.008

@@ -1,0 +1,12 @@
+Baseline is retained vector4 production kernel, candidate probes eight aligned slots. Same harness and table as vector4 experiment,40 alternating repetitions, GPU timestamps.
+load,pattern,baseline_gpu_us,candidate_gpu_us
+50,hit,60.958,59.396
+50,miss,42.271,39.583
+50,mixed,51.813,49.521
+75,hit,70.521,65.938
+75,miss,64.583,50.542
+75,mixed,38.667,33.438
+90,hit,48.354,38.729
+90,miss,105.292,76.354
+90,mixed,81.354,58.875
+Full lookup value/presence comparisons passed

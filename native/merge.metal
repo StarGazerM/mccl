@@ -216,3 +216,338 @@ kernel void mccl_bloom_contains_kernel(
   }
   out[index] = present;
 }
+
+constant uint kMapEmpty = 0xffffffffu;
+constant uint kMapTombstone = 0xfffffffeu;
+
+// xxHash32's four-byte little-endian short path with a uint32 seed.
+inline uint map_hash_u32(uint key, uint seed) {
+  constexpr uint prime2 = 2246822519u;
+  constexpr uint prime3 = 3266489917u;
+  constexpr uint prime4 = 668265263u;
+  constexpr uint prime5 = 374761393u;
+  uint hash = seed + prime5 + 4u;
+  hash += key * prime3;
+  hash = ((hash << 17) | (hash >> 15)) * prime4;
+  hash ^= hash >> 15;
+  hash *= prime2;
+  hash ^= hash >> 13;
+  hash *= prime3;
+  hash ^= hash >> 16;
+  return hash;
+}
+
+inline uint map_next_slot(uint slot, uint capacity) {
+  return slot + 1u == capacity ? 0u : slot + 1u;
+}
+
+// Empty/tombstone -> live transitions are monotonic within a claim dispatch.
+// Tombstone reuse is safe only for keys absent from the unchanged prebatch
+// table; prelookup routes existing keys directly to their original slots.
+template <bool ReuseTombstones = false>
+inline uint map_claim_slot(
+    device atomic_uint* table,
+    uint key,
+    uint capacity,
+    uint seed,
+    thread bool& inserted,
+    thread bool& reused) {
+  uint slot = map_hash_u32(key, seed) % capacity;
+  for (uint probe = 0; probe < capacity; ++probe) {
+    uint observed = atomic_load_explicit(&table[slot], memory_order_relaxed);
+    // Retry weak CAS at the same free slot so duplicates cannot pass it.
+    while (observed == kMapEmpty ||
+           (ReuseTombstones && observed == kMapTombstone)) {
+      const bool was_tombstone = observed == kMapTombstone;
+      if (atomic_compare_exchange_weak_explicit(
+              &table[slot], &observed, key,
+              memory_order_relaxed, memory_order_relaxed)) {
+        inserted = true;
+        reused = was_tombstone;
+        return slot;
+      }
+    }
+    if (observed == key) {
+      return slot;
+    }
+    slot = map_next_slot(slot, capacity);
+  }
+  return kMapEmpty;
+}
+
+kernel void mccl_map_clear_kernel(
+    device uint* keys [[buffer(0)]],
+    device atomic_uint* winners [[buffer(1)]],
+    constant uint& capacity [[buffer(2)]],
+    constant uint& winner_count [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < capacity) {
+    keys[index] = kMapEmpty;
+  }
+  // Existing winner storage is already zero after completed insertions.
+  if (index < winner_count) {
+    atomic_store_explicit(&winners[index], 0u, memory_order_relaxed);
+  }
+}
+
+kernel void mccl_map_reset_stats_kernel(
+    device uint* stats [[buffer(0)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < 4u) {
+    stats[index] = 0u;
+  }
+}
+
+kernel void mccl_map_insert_kernel(
+    device const uint* input [[buffer(0)]],
+    device atomic_uint* keys [[buffer(1)]],
+    device atomic_uint* winners [[buffer(2)]],
+    device atomic_uint* stats [[buffer(3)]],
+    device uint* slots [[buffer(4)]],
+    constant uint& count [[buffer(5)]],
+    constant uint& capacity [[buffer(6)]],
+    constant uint& seed [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count) {
+    return;
+  }
+  const uint key = input[index];
+  if (key >= kMapTombstone) {
+    if (count <= capacity / 8) slots[index] = kMapEmpty;
+    atomic_fetch_add_explicit(&stats[2], 1u, memory_order_relaxed);
+    return;
+  }
+  bool inserted = false;
+  bool reused = false;
+  const uint slot = map_claim_slot(keys, key, capacity, seed, inserted, reused);
+  if (count <= capacity / 8) slots[index] = slot;
+  if (slot == kMapEmpty) {
+    atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+    return;
+  }
+  if (inserted) atomic_fetch_add_explicit(&stats[0], 1u, memory_order_relaxed);
+  atomic_fetch_max_explicit(&winners[slot], index + 1u, memory_order_relaxed);
+}
+
+kernel void mccl_map_prelookup_kernel(
+    device const uint* input [[buffer(0)]],
+    device const uint* keys [[buffer(1)]],
+    device uint* slots [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& seed [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count) return;
+  slots[index] = kMapEmpty;
+  const uint key = input[index];
+  if (key >= kMapTombstone) return;
+  uint slot = map_hash_u32(key, seed) % capacity;
+  for (uint probe = 0; probe < capacity; ++probe) {
+    const uint observed = keys[slot];
+    if (observed == kMapEmpty) return;
+    if (observed == key) {
+      slots[index] = slot;
+      return;
+    }
+    slot = map_next_slot(slot, capacity);
+  }
+}
+
+kernel void mccl_map_insert_reuse_kernel(
+    device const uint* input [[buffer(0)]],
+    device atomic_uint* keys [[buffer(1)]],
+    device atomic_uint* winners [[buffer(2)]],
+    device atomic_uint* stats [[buffer(3)]],
+    device uint* slots [[buffer(4)]],
+    constant uint& count [[buffer(5)]],
+    constant uint& capacity [[buffer(6)]],
+    constant uint& seed [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count) return;
+  const uint key = input[index];
+  if (key >= kMapTombstone) {
+    atomic_fetch_add_explicit(&stats[2], 1u, memory_order_relaxed);
+    return;
+  }
+  uint slot = slots[index];
+  bool inserted = false;
+  bool reused = false;
+  if (slot == kMapEmpty) {
+    slot = map_claim_slot<true>(keys, key, capacity, seed, inserted, reused);
+    if (count <= capacity / 8) slots[index] = slot;
+  }
+  if (slot == kMapEmpty) {
+    atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+    return;
+  }
+  if (inserted) {
+    atomic_fetch_add_explicit(&stats[0], 1u, memory_order_relaxed);
+    if (reused) atomic_fetch_add_explicit(&stats[3], 1u, memory_order_relaxed);
+  }
+  atomic_fetch_max_explicit(&winners[slot], index + 1u, memory_order_relaxed);
+}
+
+kernel void mccl_map_publish_kernel(
+    device const uint* input_values [[buffer(0)]],
+    device atomic_uint* winners [[buffer(1)]],
+    device const uint* slots [[buffer(2)]],
+    device uint* values [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    constant uint& capacity [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  if (count <= capacity / 8) {
+    if (index >= count) return;
+    const uint slot = slots[index];
+    // Losing duplicates may read while the winner clears its ordinal. Every
+    // access must be atomic; observing zero cannot elect a second publisher.
+    if (slot < capacity &&
+        atomic_load_explicit(&winners[slot], memory_order_relaxed) == index + 1u) {
+      values[slot] = input_values[index];
+      atomic_store_explicit(&winners[slot], 0u, memory_order_relaxed);
+    }
+  } else if (index < capacity) {
+    const uint winner = atomic_load_explicit(&winners[index], memory_order_relaxed);
+    if (winner != 0u) {
+      values[index] = input_values[winner - 1u];
+      atomic_store_explicit(&winners[index], 0u, memory_order_relaxed);
+    }
+  }
+}
+
+constant uint kMapProbeWidth [[function_constant(0)]];
+
+kernel void mccl_map_find_kernel(
+    device const uint* input [[buffer(0)]],
+    device const uint* keys [[buffer(1)]],
+    device const uint* values [[buffer(2)]],
+    device uint* out_values [[buffer(3)]],
+    device uint* out_found [[buffer(4)]],
+    constant uint& count [[buffer(5)]],
+    constant uint& capacity [[buffer(6)]],
+    constant uint& seed [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count) {
+    return;
+  }
+  out_values[index] = 0u;
+  out_found[index] = 0u;
+  const uint key = input[index];
+  if (key >= kMapTombstone) {
+    return;
+  }
+  uint slot = map_hash_u32(key, seed) % capacity;
+  if (kMapProbeWidth > 1u) {
+    // Ordered queries permit an aligned vector load without atomic access.
+    // Mask the initial prefix and final wraparound suffix so the first
+    // key-or-empty encountered is identical to scalar linear probing.
+    uint base = slot & ~(kMapProbeWidth - 1u);
+    uint skip = slot & (kMapProbeWidth - 1u);
+    for (uint examined = 0; examined < capacity;) {
+      uint hit = 0u;
+      uint empty = 0u;
+      for (uint vector = 0; vector < kMapProbeWidth / 4; ++vector) {
+        const uint4 chunk =
+            reinterpret_cast<device const uint4*>(keys)[base / 4 + vector];
+        hit |= (uint(chunk.x == key) | (uint(chunk.y == key) << 1) |
+                (uint(chunk.z == key) << 2) | (uint(chunk.w == key) << 3))
+            << (4u * vector);
+        empty |= (uint(chunk.x == kMapEmpty) |
+                  (uint(chunk.y == kMapEmpty) << 1) |
+                  (uint(chunk.z == kMapEmpty) << 2) |
+                  (uint(chunk.w == kMapEmpty) << 3)) << (4u * vector);
+      }
+      const uint available = min(kMapProbeWidth - skip, capacity - examined);
+      const uint active = ((1u << available) - 1u) << skip;
+      const uint stop = (hit | empty) & active;
+      if (stop != 0u) {
+        const uint lane = ctz(stop);
+        if ((hit & (1u << lane)) != 0u) {
+          out_values[index] = values[base + lane];
+          out_found[index] = 1u;
+        }
+        return;
+      }
+      examined += available;
+      base += kMapProbeWidth;
+      if (base == capacity) base = 0;
+      skip = 0;
+    }
+    return;
+  }
+  for (uint probe = 0; probe < capacity; ++probe) {
+    const uint observed = keys[slot];
+    if (observed == kMapEmpty) {
+      return;
+    }
+    if (observed == key) {
+      out_values[index] = values[slot];
+      out_found[index] = 1u;
+      return;
+    }
+    slot = map_next_slot(slot, capacity);
+  }
+}
+
+kernel void mccl_map_erase_kernel(
+    device const uint* input [[buffer(0)]],
+    device atomic_uint* keys [[buffer(1)]],
+    device atomic_uint* stats [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    constant uint& capacity [[buffer(4)]],
+    constant uint& seed [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count) {
+    return;
+  }
+  const uint key = input[index];
+  if (key >= kMapTombstone) {
+    return;
+  }
+  uint slot = map_hash_u32(key, seed) % capacity;
+  for (uint probe = 0; probe < capacity; ++probe) {
+    uint observed = atomic_load_explicit(&keys[slot], memory_order_relaxed);
+    if (observed == kMapEmpty) {
+      return;
+    }
+    if (observed == key) {
+      do {
+        if (atomic_compare_exchange_weak_explicit(
+                &keys[slot], &observed, kMapTombstone,
+                memory_order_relaxed, memory_order_relaxed)) {
+          atomic_fetch_add_explicit(&stats[0], 1u, memory_order_relaxed);
+          return;
+        }
+      } while (observed == key);
+      // Another occurrence erased this unique key; only its CAS counts.
+      return;
+    }
+    slot = map_next_slot(slot, capacity);
+  }
+}
+
+kernel void mccl_map_rehash_kernel(
+    device const uint* old_keys [[buffer(0)]],
+    device const uint* old_values [[buffer(1)]],
+    device atomic_uint* keys [[buffer(2)]],
+    device uint* values [[buffer(3)]],
+    constant uint& old_capacity [[buffer(4)]],
+    constant uint& capacity [[buffer(5)]],
+    constant uint& seed [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= old_capacity) {
+    return;
+  }
+  const uint key = old_keys[index];
+  if (key >= kMapTombstone) {
+    return;
+  }
+  bool inserted = false;
+  bool reused = false;
+  const uint slot = map_claim_slot(
+      keys, key, capacity, seed, inserted, reused);
+  // Old keys are unique and capacity >= live size: each claims one slot.
+  // Keep the guard as a memory-safety bound independent of that invariant.
+  if (slot != kMapEmpty) {
+    values[slot] = old_values[index];
+  }
+}

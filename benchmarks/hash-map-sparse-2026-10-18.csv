@@ -1,0 +1,17 @@
+scenario,operation,query_pattern,live_keys,batch_keys,query_keys,capacity,load_factor,seed,reps,warmup,timing,p50_us,p10_us,p90_us,variant,round
+update,insert,none,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,788.520,755.246,838.650,baseline,0
+update,find,random-hit,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,248.437,218.088,259.854,baseline,0
+update,find,random-miss,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,190.334,185.204,196.267,baseline,0
+update,find,mixed-50,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,201.938,197.717,212.030,baseline,0
+update,insert,none,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,452.396,433.738,458.371,refined,0
+update,find,random-hit,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,255.062,237.183,267.100,refined,0
+update,find,random-miss,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,203.604,199.442,208.450,refined,0
+update,find,mixed-50,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,207.542,200.812,212.175,refined,0
+update,insert,none,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,451.938,419.271,505.721,refined,1
+update,find,random-hit,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,259.062,244.620,291.030,refined,1
+update,find,random-miss,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,203.355,200.187,209.100,refined,1
+update,find,mixed-50,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,208.500,201.725,213.367,refined,1
+update,insert,none,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,790.395,752.483,842.892,baseline,1
+update,find,random-hit,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,248.625,223.454,259.745,baseline,1
+update,find,random-miss,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,193.729,190.537,197.392,baseline,1
+update,find,mixed-50,1048576,1024,65536,16777216,0.062500,0,40,10,cpu_wall_completed_call,202.125,198.896,206.375,baseline,1

@@ -32,10 +32,18 @@ fn run() -> Result<()> {
             check_bloom(&Gpu::new()?)
         }
         Some("bloom-bench") => bloom_bench(BloomBenchOptions::parse(args)?),
+        Some("hashmap-check") => {
+            if args.next().is_some() {
+                return Err("hashmap-check takes no options".into());
+            }
+            check_hashmap(&Gpu::new()?)
+        }
+        Some("hashmap-bench") => hashmap_bench(MapBenchOptions::parse(args)?),
         Some("help" | "--help" | "-h") | None => {
             println!("Usage:\n  mccl check\n  mccl bench [--size N | --sizes N,N,...] [--reps N] [--warmup N]\n             [--case all|disjoint|reverse-disjoint|interleaved|duplicates]\n\nSizes are total keys (A+B); suffixes K/M mean powers of 1024.\nDefaults: sizes=1024,65536,1048576,16777216, reps=30, warmup=5.\nBenchmark CSV goes to stdout; timing is CPU wall time through completed eval+sync,\nnot GPU timestamps. Inputs are resident; every sample creates a fresh lazy output.\nNative libraries must be built separately with CMake before Cargo.");
             println!("\n  mccl difference-bench [--size N | --sizes N,N,...] [--reps N] [--warmup N]\n                        [--case all|disjoint|reverse-disjoint|interleaved|duplicates]\nDifference sizes also mean A+B. Reports survivor count and completed-call wall\np50/p10/p90, including storage and count evaluation; no merge byte/rate model.");
             println!("\n  mccl bloom-check\n  mccl bloom-bench [--keys N] [--queries N] [--blocks N] [--seed N]\n                   [--reps N] [--warmup N]\nBloom defaults: keys=65536, queries=65536, blocks=8192, seed=0, reps=30,\nwarmup=5. K/M suffixes apply to counts; seed accepts decimal or 0x hexadecimal.\nReports isolated completed clear/insert/query CPU-wall latencies in microseconds.\nUploads and readbacks excluded; observed false-positive rate is not a guarantee.");
+            println!("\n  mccl hashmap-check\n  mccl hashmap-bench [--keys N] [--batch N] [--queries N] [--capacity N]\n                     [--scenario cold-insert|update|steady-update|churn|persistent-churn]\n                     [--seed N] [--reps N] [--warmup N]\nMap defaults: keys=65536, batch=keys, queries=65536, capacity=131072,\nscenario=cold-insert, seed=0, reps=30, warmup=5. Counts accept K/M;\nseed accepts decimal or 0x hex. Keys is the live population at lookup;\nbatch is inserted/updated/replaced keys (1 <= batch <= keys).\nCold-insert starts with keys-batch entries; update starts with keys entries;\nchurn erases batch entries and inserts disjoint replacements.\nThose scenarios reset the same baseline outside each sample's timing.\nSteady-update populates once, then repeats the same existing-key/value batch.\nPersistent-churn populates once, then alternates original and disjoint replacement\nbatches, keeping the same live count without resetting through warmup/measurement.\nAll input arrays are prepared before timing. Erase, insert and random hit/miss/mixed\nlookups report separate completed-call CPU-wall latencies, including maintenance.\nSetup, upload/readback/oracle excluded; every result and the full final population\nare checked outside timing. No bandwidth model.");
             Ok(())
         }
         Some(other) => Err(format!("unknown command {other:?}; use --help").into()),
@@ -222,6 +230,7 @@ fn check() -> Result<()> {
     );
     check_difference(&gpu)?;
     check_bloom(&gpu)?;
+    check_hashmap(&gpu)?;
     Ok(())
 }
 
@@ -997,6 +1006,1095 @@ fn bloom_bench(options: BloomBenchOptions) -> Result<()> {
             options.keys, options.queries, options.blocks, options.seed, options.reps, options.warmup,
             stats.median * 1e6, stats.p10 * 1e6, stats.p90 * 1e6,
             options.queries - absent_queries)?;
+    }
+    csv.flush()?;
+    Ok(())
+}
+
+fn map_snapshot(
+    map: &mccl::HashMap,
+    gpu: &Gpu,
+    oracle: &std::collections::HashMap<u32, u32>,
+    queries: &[u32],
+) -> Result<()> {
+    if map.len() != oracle.len() || map.is_empty() != oracle.is_empty() {
+        return Err("map host length disagrees with oracle".into());
+    }
+    let result = map.find(&gpu.upload(queries)?)?;
+    let values: Vec<u32> = queries
+        .iter()
+        .map(|key| oracle.get(key).copied().unwrap_or(0))
+        .collect();
+    let found: Vec<u32> = queries
+        .iter()
+        .map(|key| u32::from(oracle.contains_key(key)))
+        .collect();
+    exact("map values", &result.values.to_vec()?, &values)?;
+    exact("map found", &result.found.to_vec()?, &found)
+}
+
+fn map_report(
+    actual: mccl::InsertReport,
+    inserted: usize,
+    full: usize,
+    invalid: usize,
+) -> Result<()> {
+    let expected = mccl::InsertReport {
+        inserted,
+        full,
+        invalid,
+    };
+    if actual != expected {
+        return Err(format!("map report {actual:?}, expected {expected:?}").into());
+    }
+    Ok(())
+}
+
+fn reference_map_hash(key: u32, seed: u32) -> u32 {
+    let mut hash = seed.wrapping_add(0x1656_67b1).wrapping_add(4);
+    hash = hash.wrapping_add(key.wrapping_mul(0xc2b2_ae3d));
+    hash = hash.rotate_left(17).wrapping_mul(0x27d4_eb2f);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x85eb_ca77);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae3d);
+    hash ^ (hash >> 16)
+}
+
+fn check_map_winner_lifecycle(gpu: &Gpu) -> Result<()> {
+    use std::collections::HashMap as Oracle;
+    for seed in [0, 1, 0x9e37_79b9, u32::MAX] {
+        // Wrap a long collision chain at creation; retain these exact keys as
+        // rehashes change the hash modulus and the sparse publication cutoff.
+        let colliders: Vec<u32> = (0..u32::MAX - 1)
+            .filter(|&key| reference_map_hash(key, seed) % 257 == 256)
+            .take(50)
+            .collect();
+        let keys = &colliders[..48];
+        let absent = &colliders[48..];
+        let queries: Vec<u32> = colliders
+            .iter()
+            .copied()
+            .chain([u32::MAX - 1, u32::MAX])
+            .collect();
+        let initial_values: Vec<u32> = (0..keys.len())
+            .map(|i| [0, u32::MAX, u32::MAX - 1, 1 << 31][i % 4])
+            .collect();
+        let initial_input = gpu.upload(keys)?;
+        let initial_value_input = gpu.upload(&initial_values)?;
+        let mut map = gpu.hash_map(257, seed)?;
+        let mut oracle: Oracle<u32, u32> = keys
+            .iter()
+            .copied()
+            .zip(initial_values.iter().copied())
+            .collect();
+        map_report(map.insert(&initial_input, &initial_value_input)?, 48, 0, 0)?;
+        map_snapshot(&map, gpu, &oracle, &queries)?;
+        for capacity in [257, 521, 129, 48, 4096, 257] {
+            map.rehash(capacity)?;
+            if map.capacity() != capacity || map.seed() != seed {
+                return Err("winner lifecycle rehash metadata mismatch".into());
+            }
+            map_snapshot(&map, gpu, &oracle, &queries)?;
+            let cutoff = capacity as usize / 8;
+            for round in 0..3 {
+                for count in [cutoff + 1, 1, cutoff - 1, cutoff, cutoff + 1, cutoff, 1] {
+                    let batch: Vec<u32> = (0..count)
+                        .map(|i| match i % 13 {
+                            11 => u32::MAX,
+                            12 => u32::MAX - 1,
+                            _ => keys[i % 3],
+                        })
+                        .collect();
+                    let values: Vec<u32> = (0..count)
+                        .map(|i| {
+                            if round == 1 {
+                                // Repeated values must still clear the winning
+                                // ordinal before a later, shorter batch.
+                                71
+                            } else {
+                                (capacity << 20)
+                                    ^ ((round as u32) << 16)
+                                    ^ ((count as u32) << 8)
+                                    ^ i as u32
+                            }
+                        })
+                        .collect();
+                    let invalid = batch.iter().filter(|&&key| key >= u32::MAX - 1).count();
+                    oracle.extend(
+                        batch
+                            .iter()
+                            .copied()
+                            .zip(values.iter().copied())
+                            .filter(|&(key, _)| key < u32::MAX - 1),
+                    );
+                    map_report(
+                        map.insert(&gpu.upload(&batch)?, &gpu.upload(&values)?)?,
+                        0,
+                        0,
+                        invalid,
+                    )?;
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                }
+            }
+            // Rejected batches must not leave scratch winners that affect a
+            // subsequent successful update, including when every slot is full.
+            for rejected in [
+                vec![u32::MAX, u32::MAX - 1, u32::MAX],
+                if capacity == 48 {
+                    vec![absent[0], absent[1], absent[0]]
+                } else {
+                    vec![u32::MAX - 1]
+                },
+            ] {
+                let invalid = rejected.iter().filter(|&&key| key >= u32::MAX - 1).count();
+                map_report(
+                    map.insert(
+                        &gpu.upload(&rejected)?,
+                        &gpu.upload(&vec![9; rejected.len()])?,
+                    )?,
+                    0,
+                    rejected.len() - invalid,
+                    invalid,
+                )?;
+                map_snapshot(&map, gpu, &oracle, &queries)?;
+                map_report(
+                    map.insert(&gpu.upload(&[keys[0]])?, &gpu.upload(&[0])?)?,
+                    0,
+                    0,
+                    0,
+                )?;
+                oracle.insert(keys[0], 0);
+                map_snapshot(&map, gpu, &oracle, &queries)?;
+            }
+            // Small deletion batches leave a live table with tombstones.
+            // Absent-only erases and finds preserve that state; a later insertion
+            // reuses holes or performs maintenance according to occupancy.
+            let erased = [keys[0], keys[1], keys[2], keys[0], u32::MAX];
+            let erase_input = gpu.upload(&erased)?;
+            for round in 0..3 {
+                if map.erase(&erase_input)? != 3 {
+                    return Err("winner lifecycle small erase count mismatch".into());
+                }
+                for key in &erased {
+                    oracle.remove(key);
+                }
+                map_snapshot(&map, gpu, &oracle, &queries)?;
+                for _ in 0..3 {
+                    if map.erase(&erase_input)? != 0 {
+                        return Err("winner lifecycle absent erase changed count".into());
+                    }
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                }
+                if round == 1 {
+                    map.rehash(capacity)?;
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                }
+                let batch = [keys[0], keys[1], keys[2], keys[0], keys[1], keys[2]];
+                let values = [0, 1, 2, u32::MAX, 71, round];
+                map_report(
+                    map.insert(&gpu.upload(&batch)?, &gpu.upload(&values)?)?,
+                    3,
+                    0,
+                    0,
+                )?;
+                oracle.extend(batch.into_iter().zip(values));
+                map_snapshot(&map, gpu, &oracle, &queries)?;
+            }
+        }
+        // Clear and reuse the same map and its grown insertion scratch, first
+        // with a large duplicate winner ordinal, then with ordinal one.
+        for value in [0, u32::MAX, 71] {
+            map.clear()?;
+            oracle.clear();
+            map_snapshot(&map, gpu, &oracle, &queries)?;
+            map_report(
+                map.insert(
+                    &gpu.upload(&vec![keys[0]; 129])?,
+                    &gpu.upload(&vec![value; 129])?,
+                )?,
+                1,
+                0,
+                0,
+            )?;
+            oracle.insert(keys[0], value);
+            map_snapshot(&map, gpu, &oracle, &queries)?;
+            map_report(
+                map.insert(&gpu.upload(&[keys[0]])?, &gpu.upload(&[!value])?)?,
+                0,
+                0,
+                0,
+            )?;
+            oracle.insert(keys[0], !value);
+            map_snapshot(&map, gpu, &oracle, &queries)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_map_persistent_churn(gpu: &Gpu) -> Result<()> {
+    use std::collections::HashMap as Oracle;
+    for seed in [0, 0x9e37_79b9, u32::MAX] {
+        for capacity in [64u32, 67] {
+            let threshold = (capacity / 16) as usize;
+            let high_occupancy = (15 * capacity).div_ceil(16) as usize;
+            for live in [
+                capacity as usize / 2,
+                high_occupancy - 1,
+                high_occupancy,
+                capacity as usize,
+            ] {
+                // Adjacent home buckets create overlapping chains that wrap
+                // across slot zero. Insert singly so the erased prefix really
+                // precedes surviving keys, independent of GPU scheduling.
+                let keys: Vec<u32> = (0..u32::MAX - 1)
+                    .filter(|&key| reference_map_hash(key, seed) % capacity >= capacity - 2)
+                    .take(live * 2 + 1)
+                    .collect();
+                let mut map = gpu.hash_map(capacity, seed)?;
+                let mut oracle = Oracle::new();
+                let mut current = keys[..live].to_vec();
+                for &key in &current {
+                    map_report(
+                        map.insert(&gpu.upload(&[key])?, &gpu.upload(&[!key])?)?,
+                        1,
+                        0,
+                        0,
+                    )?;
+                    oracle.insert(key, !key);
+                }
+                let queries: Vec<u32> = keys
+                    .iter()
+                    .copied()
+                    .chain([u32::MAX - 1, u32::MAX])
+                    .collect();
+                let query_input = gpu.upload(&queries)?;
+                map_snapshot(&map, gpu, &oracle, &queries)?;
+                for round in 0..12 {
+                    let saved = map.find(&query_input)?;
+                    let saved_values: Vec<u32> = queries
+                        .iter()
+                        .map(|key| oracle.get(key).copied().unwrap_or(0))
+                        .collect();
+                    let saved_flags: Vec<u32> = queries
+                        .iter()
+                        .map(|key| u32::from(oracle.contains_key(key)))
+                        .collect();
+                    // Exercise both sides of the maintenance tombstone limit,
+                    // plus both sides of the occupied-slot limit above.
+                    let count = [1, 1, threshold - 1, threshold, threshold + 1, 1][round % 6];
+                    let erased: Vec<u32> = current[..count]
+                        .iter()
+                        .chain(&current[..count])
+                        .copied()
+                        .chain([keys[live * 2], u32::MAX, u32::MAX - 1])
+                        .collect();
+                    let erase_input = gpu.upload(&erased)?;
+                    if map.erase(&erase_input)? != count {
+                        return Err("persistent collision churn erase count mismatch".into());
+                    }
+                    for key in &erased {
+                        oracle.remove(key);
+                    }
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                    if map.erase(&erase_input)? != 0 {
+                        return Err(
+                            "persistent collision churn repeated erase changed length".into()
+                        );
+                    }
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                    let survivor = current[live - 1];
+                    if round % 6 == 0 {
+                        // Updating an existing key behind a hole must not claim
+                        // the hole; the following missing-only duplicate batch
+                        // must claim exactly one slot, even on the dense path.
+                        let values = [round as u32, u32::MAX - round as u32];
+                        map_report(
+                            map.insert(&gpu.upload(&[survivor; 2])?, &gpu.upload(&values)?)?,
+                            0,
+                            0,
+                            0,
+                        )?;
+                        oracle.insert(survivor, values[1]);
+                        map_snapshot(&map, gpu, &oracle, &queries)?;
+                    }
+                    let replacements: Vec<u32> = (0..count)
+                        .map(|i| {
+                            if current[i] == keys[i] {
+                                keys[live + i]
+                            } else {
+                                keys[i]
+                            }
+                        })
+                        .collect();
+                    let mut batch = if round % 6 == 0 {
+                        vec![replacements[0]; 1025]
+                    } else {
+                        let mut batch = replacements.clone();
+                        batch.push(survivor);
+                        batch.extend(&replacements);
+                        batch.push(survivor);
+                        if round >= 6 {
+                            // Force dense publication with the same logical set
+                            // as the earlier sparse mixed-duplicate batch.
+                            batch.extend((0..1025).map(|i| {
+                                if i % 2 == 0 {
+                                    replacements[0]
+                                } else {
+                                    survivor
+                                }
+                            }));
+                        }
+                        batch
+                    };
+                    batch.extend([u32::MAX, u32::MAX - 1]);
+                    let values: Vec<u32> = (0..batch.len())
+                        .map(|i| ((round as u32) << 24) ^ i as u32)
+                        .collect();
+                    map_report(
+                        map.insert(&gpu.upload(&batch)?, &gpu.upload(&values)?)?,
+                        count,
+                        0,
+                        2,
+                    )?;
+                    oracle.extend(
+                        batch
+                            .iter()
+                            .copied()
+                            .zip(values)
+                            .filter(|&(key, _)| key < u32::MAX - 1),
+                    );
+                    current[..count].copy_from_slice(&replacements);
+                    map_snapshot(&map, gpu, &oracle, &queries)?;
+                    if map.len() != live {
+                        return Err("persistent collision churn changed live population".into());
+                    }
+                    if live == capacity as usize {
+                        let rejected = [keys[live * 2], survivor, keys[live * 2], u32::MAX];
+                        let values = [1, round as u32, 2, 3];
+                        map_report(
+                            map.insert(&gpu.upload(&rejected)?, &gpu.upload(&values)?)?,
+                            0,
+                            2,
+                            1,
+                        )?;
+                        oracle.insert(survivor, round as u32);
+                        map_snapshot(&map, gpu, &oracle, &queries)?;
+                    }
+                    if round == 5 {
+                        map.rehash(capacity)?;
+                        map_snapshot(&map, gpu, &oracle, &queries)?;
+                    } else if round == 9 {
+                        map.rehash(capacity * 2 + 1)?;
+                        map_snapshot(&map, gpu, &oracle, &queries)?;
+                        map.rehash(capacity)?;
+                        map_snapshot(&map, gpu, &oracle, &queries)?;
+                    }
+                    exact(
+                        "persistent churn retained values",
+                        &saved.values.to_vec()?,
+                        &saved_values,
+                    )?;
+                    exact(
+                        "persistent churn retained flags",
+                        &saved.found.to_vec()?,
+                        &saved_flags,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_hashmap(gpu: &Gpu) -> Result<()> {
+    use std::collections::HashMap as Oracle;
+    for capacity in [0, i32::MAX as u32 + 1, u32::MAX] {
+        if gpu.hash_map(capacity, 0).is_ok() {
+            return Err("invalid map capacity accepted".into());
+        }
+    }
+    let empty = gpu.upload(&[])?;
+    for seed in [0, 1, u32::MAX] {
+        for capacity in [1, 3, 17, 257] {
+            let mut map = gpu.hash_map(capacity, seed)?;
+            let mut oracle = Oracle::new();
+            if map.capacity() != capacity || map.seed() != seed || !map.is_empty() {
+                return Err("incorrect new map metadata".into());
+            }
+            map_report(map.insert(&empty, &empty)?, 0, 0, 0)?;
+            if map.erase(&empty)? != 0 {
+                return Err("empty erase was nonzero".into());
+            }
+            map_snapshot(&map, gpu, &oracle, &[])?;
+            map_snapshot(&map, gpu, &oracle, &[0, u32::MAX, u32::MAX - 1])?;
+            // Force one long wrapping collision chain, including non-power-of-two capacities.
+            let keys: Vec<u32> = (0..u32::MAX - 1)
+                .filter(|&key| reference_map_hash(key, seed) % capacity == capacity - 1)
+                .take(capacity as usize)
+                .collect();
+            let values: Vec<u32> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, _)| [0, u32::MAX, u32::MAX - 1, 1 << 31][i % 4])
+                .collect();
+            // Leave one slot vacant, then fill it through a duplicate-heavy batch.
+            let n = keys.len() - 1;
+            map_report(
+                map.insert(&gpu.upload(&keys[..n])?, &gpu.upload(&values[..n])?)?,
+                n,
+                0,
+                0,
+            )?;
+            oracle.extend(keys[..n].iter().copied().zip(values[..n].iter().copied()));
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            let duplicate_keys = vec![keys[n]; 1025];
+            let duplicate_values: Vec<u32> = (0..1025).collect();
+            map_report(
+                map.insert(
+                    &gpu.upload(&duplicate_keys)?,
+                    &gpu.upload(&duplicate_values)?,
+                )?,
+                1,
+                0,
+                0,
+            )?;
+            oracle.insert(keys[n], 1024);
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            // Full maps must still find/update existing entries, and count invalid
+            // elements separately from valid inputs that cannot be admitted.
+            let absent = (0..u32::MAX - 1)
+                .find(|key| !oracle.contains_key(key))
+                .unwrap();
+            let mixed = [u32::MAX, keys[0], absent, u32::MAX - 1, keys[0], absent];
+            let mixed_values = [7, 8, 9, 10, u32::MAX, 12];
+            map_report(
+                map.insert(&gpu.upload(&mixed)?, &gpu.upload(&mixed_values)?)?,
+                0,
+                2,
+                2,
+            )?;
+            oracle.insert(keys[0], u32::MAX);
+            map_snapshot(&map, gpu, &oracle, &mixed)?;
+            let all_updates: Vec<u32> = keys.iter().chain(keys.iter()).copied().collect();
+            let all_values: Vec<u32> = (0..all_updates.len() as u32).collect();
+            map_report(
+                map.insert(&gpu.upload(&all_updates)?, &gpu.upload(&all_values)?)?,
+                0,
+                0,
+                0,
+            )?;
+            oracle.extend(all_updates.iter().copied().zip(all_values));
+            let snapshot = map.find(&gpu.upload(&keys)?)?;
+            let saved: Vec<u32> = keys.iter().map(|k| oracle[k]).collect();
+            for bad in [0, capacity - 1, u32::MAX] {
+                if map.rehash(bad).is_ok() || map.capacity() != capacity {
+                    return Err("invalid shrink changed map capacity".into());
+                }
+                map_snapshot(&map, gpu, &oracle, &keys)?;
+            }
+            map.rehash(capacity * 2 + 1)?;
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            map.rehash(capacity)?;
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            let erased_keys = [keys[0], keys[0], absent, u32::MAX, u32::MAX - 1];
+            if map.erase(&gpu.upload(&erased_keys)?)? != 1 {
+                return Err("duplicate erase was not counted uniquely".into());
+            }
+            oracle.remove(&keys[0]);
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            // Existing colliders beyond a tombstone must not gain duplicate slots.
+            let replacement: Vec<u32> = keys.iter().map(|_| 71).collect();
+            map_report(
+                map.insert(&gpu.upload(&keys)?, &gpu.upload(&replacement)?)?,
+                1,
+                0,
+                0,
+            )?;
+            oracle.extend(keys.iter().copied().map(|key| (key, 71)));
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            map.clear()?;
+            oracle.clear();
+            map_snapshot(&map, gpu, &oracle, &keys)?;
+            exact(
+                "map pre-mutation snapshot values",
+                &snapshot.values.to_vec()?,
+                &saved,
+            )?;
+            exact(
+                "map pre-mutation snapshot found",
+                &snapshot.found.to_vec()?,
+                &vec![1; keys.len()],
+            )?;
+            map_report(
+                map.insert(
+                    &gpu.upload(&[u32::MAX, 0, u32::MAX - 1, 0])?,
+                    &gpu.upload(&[1, 2, 3, 4])?,
+                )?,
+                1,
+                0,
+                2,
+            )?;
+            oracle.insert(0, 4);
+            map_snapshot(&map, gpu, &oracle, &[0, u32::MAX, u32::MAX - 1])?;
+        }
+    }
+    // Reuse insertion scratch across large, tiny, then larger batches. Include
+    // invalid lanes and repeated keys so stale slots or winner ordinals cannot
+    // silently overwrite a valid value. The final phase starts from a full map.
+    let mut resized = gpu.hash_map(37, 123)?;
+    let mut resized_oracle = Oracle::new();
+    for (batch_len, key_space) in [(513, 31), (1, 31), (1537, 37), (3, 43), (2049, 43)] {
+        let keys: Vec<u32> = (0..batch_len)
+            .map(|i| match i % 29 {
+                27 => u32::MAX,
+                28 => u32::MAX - 1,
+                _ => (i % key_space) as u32,
+            })
+            .collect();
+        let values: Vec<u32> = (0..batch_len)
+            .map(|i| (batch_len as u32).rotate_left(17) ^ i as u32)
+            .collect();
+        let before = resized_oracle.len();
+        let mut full = 0;
+        let mut invalid = 0;
+        for (&key, &value) in keys.iter().zip(&values) {
+            if key >= u32::MAX - 1 {
+                invalid += 1;
+            } else if key >= 37 {
+                full += 1;
+            } else {
+                resized_oracle.insert(key, value);
+            }
+        }
+        map_report(
+            resized.insert(&gpu.upload(&keys)?, &gpu.upload(&values)?)?,
+            resized_oracle.len() - before,
+            full,
+            invalid,
+        )?;
+        let queries: Vec<u32> = (0..43).chain([u32::MAX - 1, u32::MAX]).collect();
+        map_snapshot(&resized, gpu, &resized_oracle, &queries)?;
+    }
+    // Erase-all leaves only tombstones; repeatedly refill with different keys
+    // and preserve an earlier eager lookup snapshot across all maintenance.
+    let original_keys: Vec<u32> = (0..37).collect();
+    let snapshot = resized.find(&gpu.upload(&original_keys)?)?;
+    let saved: Vec<u32> = original_keys
+        .iter()
+        .map(|key| resized_oracle[key])
+        .collect();
+    let mut current_keys = original_keys.clone();
+    for round in 1..=4 {
+        let duplicate_erases: Vec<u32> = current_keys
+            .iter()
+            .chain(&current_keys)
+            .copied()
+            .chain([u32::MAX, u32::MAX - 1])
+            .collect();
+        if resized.erase(&gpu.upload(&duplicate_erases)?)? != 37 || !resized.is_empty() {
+            return Err("erase-all duplicate count mismatch".into());
+        }
+        resized_oracle.clear();
+        map_snapshot(&resized, gpu, &resized_oracle, &current_keys)?;
+        current_keys = (round * 37..(round + 1) * 37).collect();
+        let duplicate_inserts: Vec<u32> =
+            current_keys.iter().chain(&current_keys).copied().collect();
+        let values: Vec<u32> = (0..duplicate_inserts.len() as u32).collect();
+        map_report(
+            resized.insert(&gpu.upload(&duplicate_inserts)?, &gpu.upload(&values)?)?,
+            37,
+            0,
+            0,
+        )?;
+        resized_oracle.extend(duplicate_inserts.into_iter().zip(values));
+        let queries: Vec<u32> = original_keys.iter().chain(&current_keys).copied().collect();
+        map_snapshot(&resized, gpu, &resized_oracle, &queries)?;
+    }
+    exact(
+        "erase-all retained snapshot values",
+        &snapshot.values.to_vec()?,
+        &saved,
+    )?;
+    exact(
+        "erase-all retained snapshot flags",
+        &snapshot.found.to_vec()?,
+        &[1; 37],
+    )?;
+    // Random ordered operations remain below capacity, so the CPU oracle can
+    // assert every admission as well as deterministic last-input updates.
+    let mut random = Random(0x1234_5678_abcd_ef01);
+    let mut map = gpu.hash_map(131, 42)?;
+    let mut oracle = Oracle::new();
+    let queries: Vec<u32> = (0..129).chain([u32::MAX - 1, u32::MAX]).collect();
+    for round in 0..64 {
+        let keys: Vec<u32> = (0..193).map(|_| random.next() % 129).collect();
+        if round % 3 == 0 {
+            let before = oracle.len();
+            for key in &keys {
+                oracle.remove(key);
+            }
+            if map.erase(&gpu.upload(&keys)?)? != before - oracle.len() {
+                return Err("random erase count disagrees with oracle".into());
+            }
+        } else {
+            let values: Vec<u32> = keys.iter().map(|_| random.next()).collect();
+            let before = oracle.len();
+            oracle.extend(keys.iter().copied().zip(values.iter().copied()));
+            map_report(
+                map.insert(&gpu.upload(&keys)?, &gpu.upload(&values)?)?,
+                oracle.len() - before,
+                0,
+                0,
+            )?;
+        }
+        map_snapshot(&map, gpu, &oracle, &queries)?;
+    }
+    // Over-capacity admission is scheduling-dependent; validate the selected
+    // subset against the oracle rather than assuming which keys win.
+    let mut small = gpu.hash_map(3, 7)?;
+    let keys: Vec<u32> = (0..19).collect();
+    let values: Vec<u32> = keys.iter().map(|key| key + 100).collect();
+    map_report(
+        small.insert(&gpu.upload(&keys)?, &gpu.upload(&values)?)?,
+        3,
+        16,
+        0,
+    )?;
+    let selected = small.find(&gpu.upload(&keys)?)?;
+    let flags = selected.found.to_vec()?;
+    let actual = selected.values.to_vec()?;
+    if small.len() != 3 || flags.iter().sum::<u32>() != 3 {
+        return Err("over-capacity insertion occupancy mismatch".into());
+    }
+    for i in 0..keys.len() {
+        if flags[i] > 1 || actual[i] != if flags[i] == 1 { values[i] } else { 0 } {
+            return Err("over-capacity insertion value mismatch".into());
+        }
+    }
+    let other = Gpu::new()?;
+    let foreign = other.upload(&[0])?;
+    let local = gpu.upload(&[0])?;
+    let before = map.len();
+    if map.insert(&foreign, &local).is_ok()
+        || map.insert(&local, &foreign).is_ok()
+        || map.find(&foreign).is_ok()
+        || map.erase(&foreign).is_ok()
+        || map.insert(&local, &empty).is_ok()
+        || map.len() != before
+    {
+        return Err("map input validation failed or changed host length".into());
+    }
+    map_snapshot(&map, gpu, &oracle, &queries)?;
+    let (mut retained, input, values) = {
+        let context = Gpu::new()?;
+        (
+            context.hash_map(3, 99)?,
+            context.upload(&[0, 1])?,
+            context.upload(&[u32::MAX, 0])?,
+        )
+    };
+    map_report(retained.insert(&input, &values)?, 2, 0, 0)?;
+    let output = retained.find(&input)?;
+    retained.clear()?;
+    drop(retained);
+    drop(input);
+    drop(values);
+    exact(
+        "retained map values",
+        &output.values.to_vec()?,
+        &[u32::MAX, 0],
+    )?;
+    exact("retained map flags", &output.found.to_vec()?, &[1, 1])?;
+    check_map_winner_lifecycle(gpu)?;
+    check_map_persistent_churn(gpu)?;
+    // Full tables force bounded wraparound misses; these capacities exercise
+    // scalar and 4/8/16-slot specializations, including partial-vector origins.
+    for capacity in [3_u32, 4, 8, 12, 16, 32, 36] {
+        let mut table = gpu.hash_map(capacity, 57)?;
+        let keys: Vec<u32> = (0..capacity).collect();
+        let values: Vec<u32> = keys.iter().map(|k| !k).collect();
+        let mut expected: Oracle<u32, u32> =
+            keys.iter().copied().zip(values.iter().copied()).collect();
+        map_report(
+            table.insert(&gpu.upload(&keys)?, &gpu.upload(&values)?)?,
+            capacity as usize,
+            0,
+            0,
+        )?;
+        let queries: Vec<u32> = (0..capacity + 2).collect();
+        map_snapshot(&table, gpu, &expected, &queries)?;
+        let erased = [0, capacity - 1];
+        if table.erase(&gpu.upload(&erased)?)? != 2 {
+            return Err("lookup-width erase mismatch".into());
+        }
+        for key in erased {
+            expected.remove(&key);
+        }
+        map_snapshot(&table, gpu, &expected, &queries)?;
+        table.clear()?;
+        expected.clear();
+        map_snapshot(&table, gpu, &expected, &queries)?;
+    }
+    println!("PASS: GPU map CPU oracle, duplicate updates, collision chains, full/partial admission,\n reserved keys, all value bits, erase/reinsert, rehash preservation, snapshots and context lifetime,\n reused winner lifecycle across sparse/dense cutoffs, tombstones, clear and capacity changes,\n persistent overlapping/wrapping collision churn across maintenance thresholds");
+    Ok(())
+}
+
+struct MapBenchOptions {
+    keys: usize,
+    batch: usize,
+    queries: usize,
+    capacity: u32,
+    scenario: &'static str,
+    seed: u32,
+    reps: usize,
+    warmup: usize,
+}
+
+impl MapBenchOptions {
+    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
+        let mut options = Self {
+            keys: 65536,
+            batch: 0,
+            queries: 65536,
+            capacity: 131072,
+            scenario: "cold-insert",
+            seed: 0,
+            reps: 30,
+            warmup: 5,
+        };
+        let mut batch = None;
+        while let Some(flag) = args.next() {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("missing value for {flag}"))?;
+            match flag.as_str() {
+                "--keys" => options.keys = parse_size(&value)?,
+                "--batch" => batch = Some(parse_size(&value)?),
+                "--queries" => options.queries = parse_size(&value)?,
+                "--capacity" => options.capacity = u32::try_from(parse_size(&value)?)?,
+                "--scenario" => {
+                    options.scenario = match value.as_str() {
+                        "cold-insert" => "cold-insert",
+                        "update" => "update",
+                        "steady-update" => "steady-update",
+                        "churn" => "churn",
+                        "persistent-churn" => "persistent-churn",
+                        _ => return Err(format!("unknown map benchmark scenario {value:?}").into()),
+                    };
+                }
+                "--seed" => {
+                    options.seed = if let Some(hex) = value.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16)?
+                    } else {
+                        value.parse()?
+                    }
+                }
+                "--reps" => options.reps = value.parse()?,
+                "--warmup" => options.warmup = value.parse()?,
+                _ => return Err(format!("unknown map benchmark option {flag:?}").into()),
+            }
+        }
+        options.batch = batch.unwrap_or(options.keys);
+        if options.capacity == 0
+            || options.capacity > i32::MAX as u32
+            || options.keys == 0
+            || options.keys > options.capacity as usize
+            || options.batch == 0
+            || options.batch > options.keys
+            || options.queries < 2
+            || options.queries > i32::MAX as usize
+            || options.reps == 0
+            || options.warmup == 0
+        {
+            return Err("map benchmark needs 1 <= batch <= keys <= capacity <= INT_MAX, 2 <= queries <= INT_MAX, and nonzero reps/warmup".into());
+        }
+        Ok(options)
+    }
+}
+
+fn map_bench_random_below(random: &mut Random, bound: u32) -> u32 {
+    // Rejection sampling avoids modulo bias, including for the large absent
+    // key domain. Callers always supply a nonzero bound.
+    let threshold = bound.wrapping_neg() % bound;
+    loop {
+        let value = random.next();
+        if value >= threshold {
+            return value % bound;
+        }
+    }
+}
+
+fn map_bench_shuffle(keys: &mut [u32], random: &mut Random) {
+    for i in (1..keys.len()).rev() {
+        let j = map_bench_random_below(random, (i + 1) as u32) as usize;
+        keys.swap(i, j);
+    }
+}
+
+fn hashmap_bench(options: MapBenchOptions) -> Result<()> {
+    use std::collections::HashMap as Oracle;
+    let gpu = Gpu::new()?;
+    let mut map = gpu.hash_map(options.capacity, options.seed)?;
+    let mut random = Random(0x1234_5678_abcd_ef01 ^ u64::from(options.seed));
+    let key_count = options.keys as u32;
+    let batch_count = options.batch as u32;
+    let persistent = options.scenario == "persistent-churn";
+    let churn = options.scenario == "churn" || persistent;
+    let steady = options.scenario == "steady-update";
+    let update = options.scenario == "update" || steady;
+    let baseline_start = if options.scenario == "cold-insert" {
+        batch_count
+    } else {
+        0
+    };
+    let mut baseline_keys: Vec<u32> = (baseline_start..key_count).collect();
+    map_bench_shuffle(&mut baseline_keys, &mut random);
+    let baseline_values: Vec<u32> = baseline_keys.iter().map(|key| !key).collect();
+    let baseline_input = gpu.upload(&baseline_keys)?;
+    let baseline_value_input = gpu.upload(&baseline_values)?;
+    struct Phase {
+        input: U32Array,
+        values: U32Array,
+        erase: Option<U32Array>,
+        lookups: Vec<(U32Array, Vec<u32>, Vec<u32>)>,
+        baseline_values: Vec<u32>,
+        baseline_flags: Vec<u32>,
+        batch_values: Vec<u32>,
+    }
+    let patterns = ["random-hit", "random-miss", "mixed-50"];
+    let mut phases = Vec::new();
+    // Both directions, including query arrays and CPU expectations, are resident
+    // before warmup. Only persistent churn alternates phases without resetting.
+    for phase in 0..if persistent { 2 } else { 1 } {
+        let replacing = churn && phase == 0;
+        let mut batch_keys: Vec<u32> = if replacing {
+            (key_count..key_count + batch_count).collect()
+        } else {
+            (0..batch_count).collect()
+        };
+        map_bench_shuffle(&mut batch_keys, &mut random);
+        let batch_values: Vec<u32> = batch_keys
+            .iter()
+            .map(|&key| {
+                if update || phase == 1 {
+                    key ^ 0xa5a5_a5a5
+                } else {
+                    !key
+                }
+            })
+            .collect();
+        let erase = if churn {
+            let mut keys: Vec<u32> = if replacing {
+                (0..batch_count).collect()
+            } else {
+                (key_count..key_count + batch_count).collect()
+            };
+            map_bench_shuffle(&mut keys, &mut random);
+            Some(gpu.upload(&keys)?)
+        } else {
+            None
+        };
+        let mut oracle: Oracle<u32, u32> = baseline_keys
+            .iter()
+            .copied()
+            .zip(baseline_values.iter().copied())
+            .collect();
+        if replacing {
+            for key in 0..batch_count {
+                oracle.remove(&key);
+            }
+        }
+        oracle.extend(batch_keys.iter().copied().zip(batch_values.iter().copied()));
+        // Live keys form one contiguous range in each phase. Map uniform absent
+        // ranks around it, excluding reserved keys even at maximum capacity.
+        let live_start = if replacing { batch_count } else { 0 };
+        let absent_count = (u32::MAX - 1) - key_count;
+        let mut lookups = Vec::new();
+        for pattern in patterns {
+            let mut queries: Vec<u32> = (0..options.queries)
+                .map(|i| {
+                    if pattern == "random-hit" || (pattern == "mixed-50" && i % 2 == 0) {
+                        live_start + map_bench_random_below(&mut random, key_count)
+                    } else {
+                        let rank = map_bench_random_below(&mut random, absent_count);
+                        if rank < live_start {
+                            rank
+                        } else {
+                            rank + key_count
+                        }
+                    }
+                })
+                .collect();
+            map_bench_shuffle(&mut queries, &mut random);
+            let expected_values = queries
+                .iter()
+                .map(|key| oracle.get(key).copied().unwrap_or(0))
+                .collect();
+            let expected_flags = queries
+                .iter()
+                .map(|key| u32::from(oracle.contains_key(key)))
+                .collect();
+            lookups.push((gpu.upload(&queries)?, expected_values, expected_flags));
+        }
+        phases.push(Phase {
+            input: gpu.upload(&batch_keys)?,
+            values: gpu.upload(&batch_values)?,
+            erase,
+            lookups,
+            baseline_values: baseline_keys
+                .iter()
+                .map(|key| oracle.get(key).copied().unwrap_or(0))
+                .collect(),
+            baseline_flags: baseline_keys
+                .iter()
+                .map(|key| u32::from(oracle.contains_key(key)))
+                .collect(),
+            batch_values,
+        });
+    }
+    let batch_expected_flags = vec![1; options.batch];
+    let erased_expected = vec![0; options.batch];
+    let mut lookup_samples: Vec<_> = patterns
+        .iter()
+        .map(|_| Vec::with_capacity(options.reps))
+        .collect();
+    eprintln!("Map timing: CPU-wall completed calls, including GPU maintenance; inputs resident.");
+    if steady {
+        eprintln!("Steady-update populates once before warmup; no reset/repopulation between samples.\nEvery insertion repeats the same existing-key/value batch, so measured logical\nstate is unchanged after warmup, but each call must execute and return exact counters.");
+    } else if persistent {
+        eprintln!("Persistent-churn populates once before warmup, then alternates original and\ndisjoint replacement batches without resetting. Erase, insertion (including any\nmaintenance) and each lookup are timed separately; live population stays fixed.");
+    } else {
+        eprintln!("Each sample clears/repopulates the same baseline outside timing.\nChurn times erase then replacement insert, including any tombstone rebuild;\nreplacement keys differ from erased keys, so churn changes the logical state.");
+    }
+    eprintln!("Three lookup patterns see the final population: uniform hits, uniform nonreserved\nabsent keys, and shuffled 50/50 (one extra hit for odd query counts).\nCreation, initial setup, reset, uploads, readbacks, CPU oracle and output destruction excluded.\nEvery warmup/sample validates exact counters, all lookup outputs and the full final table.\nNo bandwidth model.");
+    let mut inserts = Vec::with_capacity(options.reps);
+    let mut erases = Vec::with_capacity(options.reps);
+    if steady || persistent {
+        map_report(
+            map.insert(&baseline_input, &baseline_value_input)?,
+            baseline_keys.len(),
+            0,
+            0,
+        )?;
+    }
+    for sample in 0..options.warmup + options.reps {
+        let measured = sample >= options.warmup;
+        let phase = &phases[sample % phases.len()];
+        if !steady && !persistent {
+            map.clear()?;
+            map_report(
+                map.insert(&baseline_input, &baseline_value_input)?,
+                baseline_keys.len(),
+                0,
+                0,
+            )?;
+        }
+        if let Some(erase_input) = &phase.erase {
+            let start = Instant::now();
+            let erased = map.erase(erase_input)?;
+            let elapsed = start.elapsed().as_secs_f64();
+            if measured {
+                erases.push(elapsed);
+            }
+            if erased != options.batch || map.len() != options.keys - options.batch {
+                return Err("map benchmark erase count mismatch".into());
+            }
+        }
+        let start = Instant::now();
+        let report = map.insert(&phase.input, &phase.values)?;
+        let elapsed = start.elapsed().as_secs_f64();
+        if measured {
+            inserts.push(elapsed);
+        }
+        map_report(report, if update { 0 } else { options.batch }, 0, 0)?;
+        if map.len() != options.keys {
+            return Err("map benchmark live count mismatch".into());
+        }
+        for ((queries, expected_values, expected_flags), samples) in
+            phase.lookups.iter().zip(&mut lookup_samples)
+        {
+            let start = Instant::now();
+            let output = map.find(queries)?;
+            let elapsed = start.elapsed().as_secs_f64();
+            if measured {
+                samples.push(elapsed);
+            }
+            exact(
+                "map benchmark values",
+                &output.values.to_vec()?,
+                expected_values,
+            )?;
+            exact(
+                "map benchmark found",
+                &output.found.to_vec()?,
+                expected_flags,
+            )?;
+        }
+        for (queries, values, flags) in [
+            (
+                &baseline_input,
+                &phase.baseline_values,
+                &phase.baseline_flags,
+            ),
+            (&phase.input, &phase.batch_values, &batch_expected_flags),
+        ] {
+            let output = map.find(queries)?;
+            exact(
+                "map benchmark full values",
+                &output.values.to_vec()?,
+                values,
+            )?;
+            exact("map benchmark full found", &output.found.to_vec()?, flags)?;
+        }
+        if let Some(erased) = &phase.erase {
+            let output = map.find(erased)?;
+            exact(
+                "map benchmark erased values",
+                &output.values.to_vec()?,
+                &erased_expected,
+            )?;
+            exact(
+                "map benchmark erased flags",
+                &output.found.to_vec()?,
+                &erased_expected,
+            )?;
+        }
+    }
+    let stdout = io::stdout();
+    let mut csv = io::BufWriter::new(stdout.lock());
+    writeln!(
+        csv,
+        "scenario,operation,query_pattern,live_keys,batch_keys,query_keys,capacity,load_factor,seed,reps,warmup,timing,p50_us,p10_us,p90_us"
+    )?;
+    let mut rows = vec![("insert", "none", inserts)];
+    if churn {
+        rows.push(("erase", "none", erases));
+    }
+    rows.extend(
+        patterns
+            .into_iter()
+            .zip(lookup_samples)
+            .map(|(pattern, samples)| ("find", pattern, samples)),
+    );
+    for (operation, pattern, samples) in rows {
+        let stats = Stats::new(samples);
+        writeln!(
+            csv,
+            "{},{operation},{pattern},{},{},{},{},{:.6},{},{},{},cpu_wall_completed_call,{:.3},{:.3},{:.3}",
+            options.scenario,
+            options.keys,
+            options.batch,
+            options.queries,
+            options.capacity,
+            options.keys as f64 / f64::from(options.capacity),
+            options.seed,
+            options.reps,
+            options.warmup,
+            stats.median * 1e6,
+            stats.p10 * 1e6,
+            stats.p90 * 1e6
+        )?;
     }
     csv.flush()?;
     Ok(())

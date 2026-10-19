@@ -1,0 +1,44 @@
+{
+  "trace": "build/profile/map-final-2026-10-18.trace",
+  "stage": "winner cleanup plus vector4 and tombstone reuse, before final wider lookup specialization",
+  "workload": "90% load, mixed steady-update benchmark including hit/miss/mixed lookup",
+  "aggregation": "Point samples during process GPU intervals in middle60% of GPU span, device-wide counters may include desktop. Not per-kernel isolated. Recording had logging stream error.",
+  "metrics": {
+    "Kernel Occupancy": {
+      "mean": 27.591237128328164,
+      "samples": 4137
+    },
+    "Integer and Conditional Limiter": {
+      "mean": 44.005021432683634,
+      "samples": 4137
+    },
+    "Control Flow Limiter": {
+      "mean": 28.158908049998146,
+      "samples": 4137
+    },
+    "L1 Cache Limiter": {
+      "mean": 4.2671437217527215,
+      "samples": 4137
+    },
+    "Register Pressure Influence": {
+      "mean": 0.0,
+      "samples": 4137
+    },
+    "Memory Request Stalls Influence": {
+      "mean": 15.782037068050277,
+      "samples": 4137
+    },
+    "GPU Bandwidth": {
+      "mean": 168.67469468066886,
+      "samples": 1745
+    },
+    "MMU Limiter": {
+      "mean": 45.37903854624642,
+      "samples": 1745
+    },
+    "Last Level Cache Limiter": {
+      "mean": 60.098060621065365,
+      "samples": 1745
+    }
+  }
+}

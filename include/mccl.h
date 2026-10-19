@@ -116,6 +116,94 @@ MCCL_API int mccl_bloom_contains(
 MCCL_API int mccl_bloom_read_words(
     mccl_bloom* filter, uint32_t* out, size_t words);
 
+/*
+ * Fixed-capacity GPU uint32 -> uint32 hash map. UINT32_MAX is the empty-key
+ * sentinel and UINT32_MAX - 1 is the tombstone-key sentinel: neither is a valid
+ * key. Every uint32 value is valid. Hashing is seeded xxHash32 of the key's four
+ * little-endian bytes, reduced modulo the exact capacity, with linear probing
+ * bounded by capacity. Capacity is never rounded or grown automatically.
+ *
+ * Handles are thread-affine, retain the supplied GPU stream by value, and must
+ * not be used concurrently. All operations are ordered, commit and wait for GPU
+ * completion before returning; there are no lazy mutations. Inputs must be
+ * one-dimensional uint32 arrays of length <= INT_MAX. Noncontiguous inputs are
+ * materialized on the retained stream before accessing private map storage.
+ *
+ * All functions return 0 on success and 1 on error via mccl_last_error().
+ * free(NULL) succeeds; other null map handles are errors. Argument errors leave
+ * the map unchanged. Insert/erase/clear are not transactional once GPU encoding
+ * begins: encoding, commit, or execution failure may leave storage and host
+ * counts inconsistent, and the stream may have failed; discard the map.
+ * Rehash publishes replacement buffers only after successful GPU completion,
+ * leaving the original entries intact on failure.
+ */
+typedef struct mccl_map mccl_map;
+
+/* out must not be null; *out changes only on success. Capacity must be positive,
+ * <= INT_MAX, and each capacity * sizeof(uint32_t) buffer must fit the Metal
+ * device's maximum buffer length. Allocation can still fail. Private storage
+ * is three capacity-sized uint32 buffers plus four private uint32 counters, with
+ * a reusable uint32 slot buffer for sparse batches or any tombstone-reuse batch.
+ */
+MCCL_API int mccl_map_create(
+    mccl_map** out, uint32_t capacity, uint32_t seed, mlx_stream s);
+MCCL_API int mccl_map_free(mccl_map* map);
+MCCL_API int mccl_map_clear(mccl_map* map);
+
+/* keys and values must have equal lengths. Reports must be nonnull, distinct
+ * pointers and change only on success. inserted counts unique newly occupied
+ * slots; full counts valid input occurrences not admitted because the table is
+ * full; invalid counts reserved-key input occurrences. Partial admission returns
+ * success with nonzero full/invalid. Existing keys are updated even when full.
+ * The last input occurrence wins for every admitted key. Which distinct new
+ * keys win insufficient remaining space is scheduling-dependent.
+ *
+ * Each nonempty call resets four private counters, claims keys using uint32
+ * atomics, then publishes values and atomically clears the winning ordinals.
+ * The fourth counter tracks reused tombstones; the public reports remain three.
+ * The winner buffer stays zero between completed insertions; there is no
+ * capacity-sized per-call reset. Batches <= capacity/8 record input slots and
+ * publish across the batch; larger batches scan winners across capacity.
+ * With no tombstones, larger batches avoid slot scratch. With tombstones, a
+ * separate read-only prelookup records every input's existing slot or absence
+ * before any claim: existing keys update their slots, absent keys may claim
+ * empty slots or tombstones. Slot scratch grows without copying and is retained.
+ * Erase counts unique tombstones. Before a nonempty insert, maintenance rebuilds
+ * at the same capacity if tombstones >= max(1,capacity/16) or live+tombstones >=
+ * ceil(15*capacity/16). This conservative policy limits accumulated probe chains;
+ * it neither grows capacity nor limits admission below full capacity. Rebuild
+ * scans the old capacity, probes survivors, and allocates replacement key/value
+ * buffers. A table with tombstones but no live entries is cleared in place
+ * instead. Maintenance is included in the call.
+ */
+MCCL_API int mccl_map_insert(
+    mccl_map* map, mlx_array keys, mlx_array values,
+    uint64_t* inserted, uint64_t* full, uint64_t* invalid);
+
+/* values and found must point to distinct initialized mlx_array handles with
+ * distinct nonnull contexts (mlx_array_new() is sufficient). Both handles are
+ * replaced only on success, and may alias input handles. Returned arrays are
+ * independent completed uint32 snapshots of shape {len(keys)}: found is 0/1;
+ * values is zero for absent keys. Reserved query keys are always absent.
+ */
+MCCL_API int mccl_map_find(
+    mlx_array* values, mlx_array* found, mccl_map* map, mlx_array keys);
+
+/* erased must not be null and changes only on success. Duplicate input keys
+ * count once; missing and reserved keys do not count. No rebuilding occurs in
+ * erase itself; lookup continues through tombstones.
+ */
+MCCL_API int mccl_map_erase(
+    mccl_map* map, mlx_array keys, uint64_t* erased);
+
+/* Preserves every entry and the seed. Capacity has the create constraints and
+ * must be >= the live entry count; rejection leaves the map unchanged. Rebuild
+ * scans the old capacity and probes each live key into new key/value buffers;
+ * a changed capacity also allocates and zeroes a new winner buffer. Old and new
+ * storage coexist until successful completion. Same-capacity clean maps are a no-op.
+ */
+MCCL_API int mccl_map_rehash(mccl_map* map, uint32_t capacity);
+
 /* Thread-local message, valid until the next mccl operation on this thread.
  * Empty after a successful operation. The returned pointer must not be freed.
  */

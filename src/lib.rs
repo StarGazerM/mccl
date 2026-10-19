@@ -28,6 +28,11 @@ mod ffi {
     pub struct Bloom {
         _private: [u8; 0],
     }
+
+    #[repr(C)]
+    pub struct Map {
+        _private: [u8; 0],
+    }
     // mlx/c/array.h at the commit pinned by CMake: MLX_UINT32 = 3.
     pub const UINT32: c_int = 3;
     extern "C" {
@@ -70,6 +75,30 @@ mod ffi {
         pub fn mccl_bloom_add(filter: *mut Bloom, keys: Array) -> c_int;
         pub fn mccl_bloom_contains(out: *mut Array, filter: *mut Bloom, keys: Array) -> c_int;
         pub fn mccl_bloom_read_words(filter: *mut Bloom, out: *mut u32, words: usize) -> c_int;
+        pub fn mccl_map_create(
+            out: *mut *mut Map,
+            capacity: u32,
+            seed: u32,
+            stream: Stream,
+        ) -> c_int;
+        pub fn mccl_map_free(map: *mut Map) -> c_int;
+        pub fn mccl_map_clear(map: *mut Map) -> c_int;
+        pub fn mccl_map_insert(
+            map: *mut Map,
+            keys: Array,
+            values: Array,
+            inserted: *mut u64,
+            full: *mut u64,
+            invalid: *mut u64,
+        ) -> c_int;
+        pub fn mccl_map_find(
+            values: *mut Array,
+            found: *mut Array,
+            map: *mut Map,
+            keys: Array,
+        ) -> c_int;
+        pub fn mccl_map_erase(map: *mut Map, keys: Array, erased: *mut u64) -> c_int;
+        pub fn mccl_map_rehash(map: *mut Map, capacity: u32) -> c_int;
         pub fn mccl_last_error() -> *const c_char;
     }
 }
@@ -244,6 +273,136 @@ impl BloomFilter {
     }
 }
 
+/// A fixed-capacity, thread-affine GPU u32-to-u32 map retaining its context.
+/// All operations complete before returning. Keys MAX and MAX-1 are reserved;
+/// every u32 value is valid. Capacity is exact, not rounded.
+pub struct HashMap {
+    raw: *mut ffi::Map,
+    capacity: u32,
+    seed: u32,
+    len: usize,
+    context: Gpu,
+}
+
+/// Completed insertion counts. Partial admission is reported, not an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InsertReport {
+    /// Unique newly occupied slots (updates are not counted).
+    pub inserted: usize,
+    /// Input elements rejected because no slot was available.
+    pub full: usize,
+    /// Input elements using either reserved key.
+    pub invalid: usize,
+}
+
+/// Independent completed arrays in query order. Missing values and flags are
+/// zero; found flags are one, including when a present value is zero or MAX.
+pub struct MapLookup {
+    pub values: U32Array,
+    pub found: U32Array,
+}
+
+impl Drop for HashMap {
+    fn drop(&mut self) {
+        unsafe { ffi::mccl_map_free(self.raw) };
+    }
+}
+
+impl HashMap {
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Inserts or updates keys. For admitted duplicates, the last input value
+    /// wins. Admission order when over capacity is unspecified. Empty input is valid.
+    pub fn insert(&mut self, keys: &U32Array, values: &U32Array) -> Result<InsertReport> {
+        self.context.check_context(keys)?;
+        self.context.check_context(values)?;
+        if keys.len != values.len {
+            return Err(Error("map keys and values must have equal lengths".into()));
+        }
+        let (mut inserted, mut full, mut invalid) = (0, 0, 0);
+        native_status(
+            unsafe {
+                ffi::mccl_map_insert(
+                    self.raw,
+                    keys.raw,
+                    values.raw,
+                    &mut inserted,
+                    &mut full,
+                    &mut invalid,
+                )
+            },
+            "insert map entries",
+        )?;
+        let report = InsertReport {
+            inserted: inserted as usize,
+            full: full as usize,
+            invalid: invalid as usize,
+        };
+        self.len += report.inserted;
+        Ok(report)
+    }
+
+    /// Returns a snapshot unaffected by later map mutations or destruction.
+    /// Reserved keys always produce absent results.
+    pub fn find(&self, keys: &U32Array) -> Result<MapLookup> {
+        self.context.check_context(keys)?;
+        let mut values = self.context.output(keys.len);
+        let mut found = self.context.output(keys.len);
+        native_status(
+            unsafe { ffi::mccl_map_find(&mut values.raw, &mut found.raw, self.raw, keys.raw) },
+            "find map entries",
+        )?;
+        Ok(MapLookup { values, found })
+    }
+
+    /// Removes keys and reports unique entries erased, ignoring missing and
+    /// reserved keys. Maintenance needed for subsequent insertion is GPU-resident.
+    pub fn erase(&mut self, keys: &U32Array) -> Result<usize> {
+        self.context.check_context(keys)?;
+        let mut erased = 0;
+        native_status(
+            unsafe { ffi::mccl_map_erase(self.raw, keys.raw, &mut erased) },
+            "erase map entries",
+        )?;
+        self.len -= erased as usize;
+        Ok(erased as usize)
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        native_status(unsafe { ffi::mccl_map_clear(self.raw) }, "clear map")?;
+        self.len = 0;
+        Ok(())
+    }
+
+    /// Rebuilds at exactly this capacity, preserving entries and seed.
+    /// Capacity smaller than len is rejected without changing the map.
+    pub fn rehash(&mut self, capacity: u32) -> Result<()> {
+        if capacity == 0 || capacity > c_int::MAX as u32 || (capacity as usize) < self.len {
+            return Err(Error("map capacity must be in len.max(1)..=INT_MAX".into()));
+        }
+        native_status(
+            unsafe { ffi::mccl_map_rehash(self.raw, capacity) },
+            "rehash map",
+        )?;
+        self.capacity = capacity;
+        Ok(())
+    }
+}
+
 /// A lazy stable sorted multiset difference, retaining its GPU context.
 ///
 /// Only the first `count()` elements of its private capacity buffer are initialized.
@@ -358,6 +517,26 @@ impl Gpu {
             "create Bloom filter",
         )?;
         Ok(filter)
+    }
+
+    /// Creates a completed empty map with exact positive capacity <= INT_MAX.
+    /// Native allocation limits may further restrict capacity.
+    pub fn hash_map(&self, capacity: u32, seed: u32) -> Result<HashMap> {
+        if capacity == 0 || capacity > c_int::MAX as u32 {
+            return Err(Error("map capacity must be in 1..=INT_MAX".into()));
+        }
+        let mut map = HashMap {
+            raw: ptr::null_mut(),
+            capacity,
+            seed,
+            len: 0,
+            context: self.clone(),
+        };
+        native_status(
+            unsafe { ffi::mccl_map_create(&mut map.raw, capacity, seed, self.stream.0) },
+            "create map",
+        )?;
+        Ok(map)
     }
 
     /// Copies host values into a freshly dispatched GPU buffer and waits for completion.

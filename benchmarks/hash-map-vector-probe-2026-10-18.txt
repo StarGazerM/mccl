@@ -1,0 +1,12 @@
+Same valid CPU-constructed linear-probing table for both kernels, 1048576 slots and 65536 random queries. GPU timestamps, 10 warmups,40 alternating repetitions. No Metal validation or profiler enabled during timing. Exact full-output checks.
+load,pattern,scalar_gpu_us,vector_gpu_us
+50,hit,66.792,61.375
+50,miss,52.750,42.688
+50,mixed,61.958,51.708
+75,hit,91.771,70.833
+75,miss,87.271,51.729
+75,mixed,62.271,38.083
+90,hit,86.542,44.146
+90,miss,219.813,100.500
+90,mixed,167.708,80.250
+Full lookup value/presence comparisons passed

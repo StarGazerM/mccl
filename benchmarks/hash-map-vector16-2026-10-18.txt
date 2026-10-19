@@ -1,0 +1,12 @@
+Baseline vector4 versus candidate width16; same valid tables,40 alternating GPU timestamp samples.
+load,pattern,baseline_gpu_us,candidate_gpu_us
+50,hit,60.417,58.500
+50,miss,42.271,42.646
+50,mixed,51.875,49.250
+75,hit,70.896,63.250
+75,miss,93.250,64.521
+75,mixed,52.458,36.500
+90,hit,57.271,37.979
+90,miss,114.479,68.854
+90,mixed,81.500,48.521
+Full lookup value/presence comparisons passed

@@ -1,0 +1,17 @@
+scenario,operation,query_pattern,live_keys,batch_keys,query_keys,capacity,load_factor,seed,reps,warmup,timing,p50_us,p10_us,p90_us,variant
+cold-insert,insert,none,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,945.729,538.621,988.829,per-key-atomics
+cold-insert,find,random-hit,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,230.666,200.429,276.063,per-key-atomics
+cold-insert,find,random-miss,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,213.709,184.791,307.100,per-key-atomics
+cold-insert,find,mixed-50,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,234.084,199.162,273.396,per-key-atomics
+cold-insert,insert,none,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,904.541,877.383,976.508,per-key-atomics
+cold-insert,find,random-hit,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,239.480,194.263,245.546,per-key-atomics
+cold-insert,find,random-miss,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,252.042,247.263,255.667,per-key-atomics
+cold-insert,find,mixed-50,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,238.938,234.666,244.713,per-key-atomics
+cold-insert,insert,none,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,652.958,500.875,1044.629,simd-aggregated
+cold-insert,find,random-hit,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,240.021,200.288,322.458,simd-aggregated
+cold-insert,find,random-miss,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,210.979,182.238,248.233,simd-aggregated
+cold-insert,find,mixed-50,524288,524288,65536,1048576,0.500000,0,40,10,cpu_wall_completed_call,221.126,187.338,288.374,simd-aggregated
+cold-insert,insert,none,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,903.896,873.875,979.721,simd-aggregated
+cold-insert,find,random-hit,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,216.229,186.996,242.733,simd-aggregated
+cold-insert,find,random-miss,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,251.438,247.421,256.446,simd-aggregated
+cold-insert,find,mixed-50,943718,943718,65536,1048576,0.900000,0,40,10,cpu_wall_completed_call,238.458,233.621,245.721,simd-aggregated
